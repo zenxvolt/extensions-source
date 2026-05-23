@@ -30,8 +30,8 @@ jobs:
       - name: Build APK
         run: |
           chmod +x gradlew
-          ./gradlew :src:id:googledrive:spotlessApply || true
-          ./gradlew :src:id:googledrive:assembleDebug
+          ./gradlew :src:all:googledrive:spotlessApply || true
+          ./gradlew :src:all:googledrive:assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
