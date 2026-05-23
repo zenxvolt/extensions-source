@@ -22,8 +22,8 @@ import java.net.URLEncoder
 class GoogleDrive : HttpSource(), ConfigurableSource {
 
     override val name = "Google Drive"
-    override val baseUrl = "https://drive.google.com" 
-    override val lang = "all" 
+    override val baseUrl = "https://drive.google.com"
+    override val lang = "all"
     override val supportsLatest = false
 
     private val apiUrl = "https://www.googleapis.com/drive/v3/files"
@@ -42,86 +42,59 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val apiKeyPref = EditTextPreference(screen.context).apply {
             key = API_KEY_PREF
             title = "API Key Google Cloud"
-            summary = "Dibutuhkan untuk memindai struktur folder dengan cepat."
-            dialogTitle = "API Key"
+            summary = "Gunakan API Key yang sudah dibatasi untuk Google Drive API."
         }
         screen.addPreference(apiKeyPref)
 
         val pathListPref = EditTextPreference(screen.context).apply {
             key = PATH_LIST_PREF
             title = "Path list"
-            summary = "Pisahkan dengan titik koma (;). Contoh: [Collection]https://drive.google.com/drive/folders/ID_FOLDER"
-            dialogTitle = "Enter drive paths"
+            summary = "Format: [Nama]URL;[Nama]URL"
         }
         screen.addPreference(pathListPref)
     }
 
     private fun checkPreferences() {
-        if (apiKey.isBlank()) throw Exception("Harap masukkan API Key di Pengaturan Ekstensi.")
-        if (pathList.isBlank()) throw Exception("Harap masukkan Path list di Pengaturan Ekstensi.")
+        if (apiKey.isBlank() || pathList.isBlank()) throw Exception("API Key atau Path List belum diisi!")
     }
 
-    private fun getDescription(mangaFolderId: String): String {
-        return try {
-            val query = "'$mangaFolderId' in parents and name = 'description.txt' and trashed = false"
-            val encodedQuery = URLEncoder.encode(query, "UTF-8")
-            val url = "$apiUrl?q=$encodedQuery&pageSize=1&fields=files(id)&key=$apiKey"
-            
-            val request = GET(url, headers)
-            val res = client.newCall(request).execute()
-            val json = JSONObject(res.body!!.string())
-            val files = json.optJSONArray("files")
+    private fun getMetadata(mangaFolderId: String): JSONObject {
+        try {
+            val query = "'$mangaFolderId' in parents and name = 'metadata.json' and trashed = false"
+            val url = "$apiUrl?q=${URLEncoder.encode(query, "UTF-8")}&pageSize=1&fields=files(id)&key=$apiKey"
+            val jsonResponse = JSONObject(client.newCall(GET(url, headers)).execute().body!!.string())
+            val files = jsonResponse.optJSONArray("files")
             
             if (files != null && files.length() > 0) {
                 val fileId = files.getJSONObject(0).getString("id")
-                val fileUrl = "$apiUrl/$fileId?alt=media&key=$apiKey"
-                val fileRequest = GET(fileUrl, headers)
-                val fileResponse = client.newCall(fileRequest).execute()
-                fileResponse.body!!.string()
-            } else {
-                "Manga di-streaming dari Google Drive.\nPastikan Anda sudah Login via WebView (Ikon Bola Dunia)."
+                val content = client.newCall(GET("$apiUrl/$fileId?alt=media&key=$apiKey", headers)).execute().body!!.string()
+                return JSONObject(content)
             }
-        } catch (e: Exception) {
-            "Manga di-streaming dari Google Drive."
-        }
+        } catch (e: Exception) { }
+        return JSONObject()
     }
 
     override fun popularMangaRequest(page: Int): Request {
         checkPreferences()
-        val paths = pathList.split(";").map { it.trim() }.filter { it.isNotEmpty() }
-        val parentQueries = mutableListOf<String>()
-        val regex = Regex("folders/([a-zA-Z0-9_-]+)")
-        
-        for (path in paths) {
-            val match = regex.find(path)
-            if (match != null) {
-                parentQueries.add("'${match.groupValues[1]}' in parents")
-            }
+        val paths = pathList.split(";").filter { it.isNotBlank() }
+        val queries = paths.mapNotNull { path ->
+            Regex("folders/([a-zA-Z0-9_-]+)").find(path)?.groupValues?.get(1)?.let { "'$it' in parents" }
         }
+        if (queries.isEmpty()) throw Exception("URL Folder tidak valid.")
         
-        if (parentQueries.isEmpty()) throw Exception("URL Folder tidak valid.")
-        
-        val combinedParents = parentQueries.joinToString(" or ")
-        val query = "($combinedParents) and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        
-        val url = "$apiUrl?q=$encodedQuery&orderBy=name&fields=files(id,name)&key=$apiKey"
+        val url = "$apiUrl?q=${URLEncoder.encode("(${queries.joinToString(" or ")}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false", "UTF-8")}&orderBy=name&fields=files(id,name)&key=$apiKey"
         return GET(url, headers)
     }
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val json = JSONObject(response.body!!.string())
-        val files = json.optJSONArray("files") ?: return MangasPage(emptyList(), false)
+        val files = JSONObject(response.body!!.string()).optJSONArray("files") ?: return MangasPage(emptyList(), false)
         val mangas = mutableListOf<SManga>()
-
         for (i in 0 until files.length()) {
             val file = files.getJSONObject(i)
-            val mangaId = file.getString("id")
             mangas.add(SManga.create().apply {
                 title = file.getString("name")
-                url = mangaId
-                status = SManga.UNKNOWN
-                thumbnail_url = getCoverUrlForManga(mangaId)
+                url = file.getString("id")
+                thumbnail_url = getCoverUrlForManga(url)
             })
         }
         return MangasPage(mangas, false)
@@ -130,91 +103,64 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = popularMangaRequest(page)
     override fun searchMangaParse(response: Response): MangasPage = popularMangaParse(response)
 
-    private fun getCoverUrlForManga(mangaFolderId: String): String {
-        return try {
-            val query = "'$mangaFolderId' in parents and mimeType contains 'image/' and trashed = false"
-            val encodedQuery = URLEncoder.encode(query, "UTF-8")
-            val url = "$apiUrl?q=$encodedQuery&pageSize=1&fields=files(id)&key=$apiKey"
-            
-            val request = GET(url, headers)
-            val res = client.newCall(request).execute()
-            val json = JSONObject(res.body!!.string())
-            val files = json.optJSONArray("files")
-            
-            if (files != null && files.length() > 0) {
-                val fileId = files.getJSONObject(0).getString("id")
-                "$baseUrl/uc?export=view&id=$fileId"
-            } else { "" }
-        } catch (e: Exception) { "" }
-    }
-
-    override fun mangaDetailsRequest(manga: SManga): Request {
-        checkPreferences()
-        val url = "$apiUrl/${manga.url}?fields=id,name&key=$apiKey"
-        return GET(url, headers)
-    }
-
     override fun mangaDetailsParse(response: Response): SManga {
         val json = JSONObject(response.body!!.string())
         val mangaId = json.getString("id")
+        val metadata = getMetadata(mangaId)
+        
+        val authorName = metadata.optString("author", "Unknown")
+        val publisherName = metadata.optString("publisher", "")
+        
         return SManga.create().apply {
             title = json.getString("name")
-            description = getDescription(mangaId)
+            description = metadata.optString("description", "Manga di-streaming dari Google Drive.")
+            // Gabungkan Author dan Publisher
+            author = if (publisherName.isNotEmpty()) "$authorName | $publisherName" else authorName
+            status = when (metadata.optInt("status", 0)) {
+                1 -> SManga.ONGOING
+                2 -> SManga.COMPLETED
+                6 -> SManga.CANCELLED
+                else -> SManga.UNKNOWN
+            }
             thumbnail_url = getCoverUrlForManga(mangaId)
             initialized = true
         }
     }
 
-    override fun chapterListRequest(manga: SManga): Request {
-        checkPreferences()
-        val mangaFolderId = manga.url
-        val query = "'$mangaFolderId' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val url = "$apiUrl?q=$encodedQuery&orderBy=name&fields=files(id,name)&key=$apiKey"
-        return GET(url, headers)
+    private fun getCoverUrlForManga(mangaFolderId: String): String {
+        return try {
+            val query = "'$mangaFolderId' in parents and mimeType contains 'image/' and trashed = false"
+            val url = "$apiUrl?q=${URLEncoder.encode(query, "UTF-8")}&pageSize=1&fields=files(id)&key=$apiKey"
+            val files = JSONObject(client.newCall(GET(url, headers)).execute().body!!.string()).optJSONArray("files")
+            if (files != null && files.length() > 0) "$baseUrl/uc?export=view&id=${files.getJSONObject(0).getString("id")}" else ""
+        } catch (e: Exception) { "" }
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val json = JSONObject(response.body!!.string())
-        val files = json.optJSONArray("files") ?: return emptyList()
-        val chapters = mutableListOf<SChapter>()
-
-        for (i in 0 until files.length()) {
+        val files = JSONObject(response.body!!.string()).optJSONArray("files") ?: return emptyList()
+        return (0 until files.length()).map { i ->
             val file = files.getJSONObject(i)
-            chapters.add(SChapter.create().apply {
+            SChapter.create().apply {
                 name = file.getString("name")
                 url = file.getString("id")
                 chapter_number = (i + 1).toFloat()
-            })
-        }
-        return chapters.reversed()
-    }
-
-    override fun pageListRequest(chapter: SChapter): Request {
-        checkPreferences()
-        val chapterFolderId = chapter.url
-        val query = "'$chapterFolderId' in parents and mimeType contains 'image/' and trashed = false"
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val url = "$apiUrl?q=$encodedQuery&orderBy=name&fields=files(id)&key=$apiKey"
-        return GET(url, headers)
+            }
+        }.reversed()
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val json = JSONObject(response.body!!.string())
-        val files = json.optJSONArray("files") ?: return emptyList()
-        val pages = mutableListOf<Page>()
-
-        for (i in 0 until files.length()) {
-            val fileId = files.getJSONObject(i).getString("id")
-            val imageUrl = "$baseUrl/uc?export=view&id=$fileId"
-            pages.add(Page(i, imageUrl, imageUrl))
+        val files = JSONObject(response.body!!.string()).optJSONArray("files") ?: return emptyList()
+        return (0 until files.length()).map { i ->
+            Page(i, "", "$baseUrl/uc?export=view&id=${files.getJSONObject(i).getString("id")}")
         }
-        return pages
     }
 
-    override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException("Not used")
-    override fun latestUpdatesParse(response: Response): MangasPage = throw UnsupportedOperationException("Not used")
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException("Not used")
+    override fun chapterListRequest(manga: SManga): Request = GET("$apiUrl?q=${URLEncoder.encode("'${manga.url}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false", "UTF-8")}&orderBy=name&fields=files(id,name)&key=$apiKey", headers)
+    override fun pageListRequest(chapter: SChapter): Request = GET("$apiUrl?q=${URLEncoder.encode("'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false", "UTF-8")}&orderBy=name&fields=files(id)&key=$apiKey", headers)
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiUrl/${manga.url}?fields=id,name&key=$apiKey", headers)
+    override fun latestUpdatesRequest(page: Int): Request = throw Exception("Not used")
+    override fun latestUpdatesParse(response: Response): MangasPage = throw Exception("Not used")
+    override fun imageUrlParse(response: Response): String = throw Exception("Not used")
 
     companion object {
         private const val API_KEY_PREF = "API_KEY_PREF"
