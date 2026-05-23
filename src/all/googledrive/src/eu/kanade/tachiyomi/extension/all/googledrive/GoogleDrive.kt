@@ -12,7 +12,6 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
-import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.Response
 import org.json.JSONObject
@@ -39,12 +38,21 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     private val pathList: String
         get() = preferences.getString(PATH_LIST_PREF, "") ?: ""
 
+    // Menambahkan Header untuk By-pass OkHttp Cache
+    private val noCacheHeaders by lazy {
+        headersBuilder()
+            .set("Cache-Control", "no-cache, no-store, must-revalidate")
+            .build()
+    }
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val apiKeyPref = EditTextPreference(screen.context).apply {
             key = API_KEY_PREF
             title = "API Key Google Cloud"
+            summary = "Gunakan API Key yang sudah dibatasi untuk Google Drive API."
         }
         screen.addPreference(apiKeyPref)
+
         val pathListPref = EditTextPreference(screen.context).apply {
             key = PATH_LIST_PREF
             title = "Path list"
@@ -61,12 +69,14 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         try {
             val query = "'$mangaFolderId' in parents and name = 'metadata.json' and trashed = false"
             val url = "$apiUrl?q=${URLEncoder.encode(query, "UTF-8")}&pageSize=1&fields=files(id)&key=$apiKey"
-            val jsonResponse = JSONObject(client.newCall(GET(url, headers)).execute().body!!.string())
+            // Gunakan noCacheHeaders di sini
+            val jsonResponse = JSONObject(client.newCall(GET(url, noCacheHeaders)).execute().body!!.string())
             val files = jsonResponse.optJSONArray("files")
             
             if (files != null && files.length() > 0) {
                 val fileId = files.getJSONObject(0).getString("id")
-                val content = client.newCall(GET("$apiUrl/$fileId?alt=media&key=$apiKey", headers)).execute().body!!.string()
+                // Gunakan noCacheHeaders di sini
+                val content = client.newCall(GET("$apiUrl/$fileId?alt=media&key=$apiKey", noCacheHeaders)).execute().body!!.string()
                 return JSONObject(content)
             }
         } catch (e: Exception) { }
@@ -80,12 +90,14 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             Regex("folders/([a-zA-Z0-9_-]+)").find(path)?.groupValues?.get(1)?.let { "'$it' in parents" }
         }
         if (queries.isEmpty()) throw Exception("URL Folder tidak valid.")
+        
         val url = "$apiUrl?q=${URLEncoder.encode("(${queries.joinToString(" or ")}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false", "UTF-8")}&orderBy=name&fields=files(id,name)&key=$apiKey"
-        return GET(url, headers)
+        // Gunakan noCacheHeaders di sini
+        return GET(url, noCacheHeaders)
     }
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val files = JSONObject(response.body!!.string()).optJSONArray("files") ?: return MangasPage(emptyList(), false)
+        val files = JSONObject(response.bodygit push.string()).optJSONArray("files") ?: return MangasPage(emptyList(), false)
         val mangas = mutableListOf<SManga>()
         for (i in 0 until files.length()) {
             val file = files.getJSONObject(i)
@@ -105,6 +117,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val json = JSONObject(response.body!!.string())
         val mangaId = json.getString("id")
         val metadata = getMetadata(mangaId)
+        
         val authorName = metadata.optString("author", "Unknown")
         val publisherName = metadata.optString("publisher", "")
         
@@ -127,13 +140,14 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         return try {
             val query = "'$mangaFolderId' in parents and mimeType contains 'image/' and trashed = false"
             val url = "$apiUrl?q=${URLEncoder.encode(query, "UTF-8")}&pageSize=1&fields=files(id)&key=$apiKey"
-            val files = JSONObject(client.newCall(GET(url, headers)).execute().body!!.string()).optJSONArray("files")
+            // Gunakan noCacheHeaders di sini
+            val files = JSONObject(client.newCall(GET(url, noCacheHeaders)).execute().body!!.string()).optJSONArray("files")
             if (files != null && files.length() > 0) "$baseUrl/uc?export=view&id=${files.getJSONObject(0).getString("id")}" else ""
         } catch (e: Exception) { "" }
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val files = JSONObject(response.body!!.string()).optJSONArray("files") ?: return emptyList()
+        val files = JSONObject(response.bodygit push.string()).optJSONArray("files") ?: return emptyList()
         return (0 until files.length()).map { i ->
             val file = files.getJSONObject(i)
             SChapter.create().apply {
@@ -144,24 +158,18 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         }.reversed()
     }
 
-    // Memaksa Aniyomi tidak menyimpan cache untuk list halaman
-    override fun pageListRequest(chapter: SChapter): Request {
-        val newHeaders = headers.newBuilder()
-            .add("Cache-Control", "no-cache")
-            .build()
-        val url = "$apiUrl?q=${URLEncoder.encode("'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false", "UTF-8")}&orderBy=name&fields=files(id)&key=$apiKey"
-        return GET(url, newHeaders)
-    }
-
     override fun pageListParse(response: Response): List<Page> {
-        val files = JSONObject(response.body!!.string()).optJSONArray("files") ?: return emptyList()
+        val files = JSONObject(response.bodygit push.string()).optJSONArray("files") ?: return emptyList()
         return (0 until files.length()).map { i ->
             Page(i, "", "$baseUrl/uc?export=view&id=${files.getJSONObject(i).getString("id")}")
         }
     }
 
-    override fun chapterListRequest(manga: SManga): Request = GET("$apiUrl?q=${URLEncoder.encode("'${manga.url}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false", "UTF-8")}&orderBy=name&fields=files(id,name)&key=$apiKey", headers)
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiUrl/${manga.url}?fields=id,name&key=$apiKey", headers)
+    // Gunakan noCacheHeaders pada fungsi-fungsi Request utama
+    override fun chapterListRequest(manga: SManga): Request = GET("$apiUrl?q=${URLEncoder.encode("'${manga.url}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false", "UTF-8")}&orderBy=name&fields=files(id,name)&key=$apiKey", noCacheHeaders)
+    override fun pageListRequest(chapter: SChapter): Request = GET("$apiUrl?q=${URLEncoder.encode("'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false", "UTF-8")}&orderBy=name&fields=files(id)&key=$apiKey", noCacheHeaders)
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiUrl/${manga.url}?fields=id,name&key=$apiKey", noCacheHeaders)
+    
     override fun latestUpdatesRequest(page: Int): Request = throw Exception("Not used")
     override fun latestUpdatesParse(response: Response): MangasPage = throw Exception("Not used")
     override fun imageUrlParse(response: Response): String = throw Exception("Not used")
