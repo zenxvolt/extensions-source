@@ -1,4 +1,4 @@
-package eu.kanade.tachiyomi.extension.id.googledrive
+package eu.kanade.tachiyomi.extension.all.googledrive
 
 import android.app.Application
 import android.content.SharedPreferences
@@ -22,9 +22,12 @@ import java.net.URLEncoder
 class GoogleDrive : HttpSource(), ConfigurableSource {
 
     override val name = "Google Drive"
-    override val baseUrl = "https://www.googleapis.com/drive/v3/files"
-    override val lang = "id"
+    // baseUrl diubah agar tombol WebView (Bola Dunia) membuka Google Drive untuk proses Login
+    override val baseUrl = "https://drive.google.com" 
+    override val lang = "all" // Diubah menjadi multi-bahasa
     override val supportsLatest = false
+
+    private val apiUrl = "https://www.googleapis.com/drive/v3/files"
 
     private val preferences: SharedPreferences by lazy {
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
@@ -33,97 +36,96 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     private val apiKey: String
         get() = preferences.getString(API_KEY_PREF, "") ?: ""
 
-    private val rootFolderId: String
-        get() = preferences.getString(FOLDER_ID_PREF, "") ?: ""
+    private val pathList: String
+        get() = preferences.getString(PATH_LIST_PREF, "") ?: ""
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val apiKeyPref = EditTextPreference(screen.context).apply {
             key = API_KEY_PREF
             title = "API Key Google Cloud"
-            summary = "Masukkan API Key (Drive API v3) Anda."
+            summary = "API Key tetap dibutuhkan untuk membaca susunan/struktur folder dengan cepat."
             dialogTitle = "API Key"
-            setDefaultValue("")
         }
         screen.addPreference(apiKeyPref)
 
-        val folderIdPref = EditTextPreference(screen.context).apply {
-            key = FOLDER_ID_PREF
-            title = "ID Folder Utama (Root Folder ID)"
-            summary = "ID folder Google Drive yang berisi daftar manga."
-            dialogTitle = "Folder ID"
-            setDefaultValue("")
+        val pathListPref = EditTextPreference(screen.context).apply {
+            key = PATH_LIST_PREF
+            title = "Path list"
+            summary = "Pisahkan dengan titik koma (;). Contoh: [Naruto]https://drive.google.com/drive/folders/ID_FOLDER"
+            dialogTitle = "Enter drive paths"
         }
-        screen.addPreference(folderIdPref)
+        screen.addPreference(pathListPref)
     }
 
-    private fun checkPreferences() {
-        if (apiKey.isBlank() || rootFolderId.isBlank()) {
-            throw Exception("Buka pengaturan ekstensi (ikon gir) untuk memasukkan API Key dan Folder ID.")
-        }
+    private fun checkApiKey() {
+        if (apiKey.isBlank()) throw Exception("Harap masukkan API Key di Pengaturan Ekstensi.")
     }
 
-    private fun getCoverUrlForManga(mangaFolderId: String): String {
-        return try {
-            val query = "'$mangaFolderId' in parents and mimeType contains 'image/' and trashed = false"
-            val encodedQuery = URLEncoder.encode(query, "UTF-8")
-            val url = "$baseUrl?q=$encodedQuery&pageSize=1&fields=files(id)&key=$apiKey"
-            
-            val request = GET(url, headers)
-            val response = client.newCall(request).execute()
-            val json = JSONObject(response.body!!.string())
-            val files = json.optJSONArray("files")
-            
-            if (files != null && files.length() > 0) {
-                val fileId = files.getJSONObject(0).getString("id")
-                "$baseUrl/$fileId?alt=media&key=$apiKey"
-            } else {
-                ""
-            }
-        } catch (e: Exception) {
-            ""
-        }
-    }
-
+    // ==========================================================
+    // 1. POPULAR MANGA (Mengambil dari Path List Pengaturan)
+    // ==========================================================
     override fun popularMangaRequest(page: Int): Request {
-        checkPreferences()
-        val query = "'$rootFolderId' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val url = "$baseUrl?q=$encodedQuery&orderBy=name&fields=files(id,name)&key=$apiKey"
-        return GET(url, headers)
+        // Kita tidak menembak API di sini, cukup memicu fungsi parse
+        return GET(baseUrl, headers)
     }
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val json = JSONObject(response.body!!.string())
-        val files = json.optJSONArray("files") ?: return MangasPage(emptyList(), false)
+        if (pathList.isBlank()) throw Exception("Path list kosong. Masukkan link folder di Pengaturan Ekstensi.")
+        
         val mangas = mutableListOf<SManga>()
+        // Membedah Path List: [Nama]URL;[Nama]URL
+        val paths = pathList.split(";").map { it.trim() }.filter { it.isNotEmpty() }
+        
+        val regex = Regex("\\[(.*?)\\](.*folders/([a-zA-Z0-9_-]+))")
 
-        for (i in 0 until files.length()) {
-            val file = files.getJSONObject(i)
-            val mangaId = file.getString("id")
-            val manga = SManga.create().apply {
-                title = file.getString("name")
-                url = mangaId
-                status = SManga.UNKNOWN
-                thumbnail_url = getCoverUrlForManga(mangaId) 
+        for (path in paths) {
+            val matchResult = regex.find(path)
+            if (matchResult != null) {
+                val titleName = matchResult.groupValues[1]
+                val folderId = matchResult.groupValues[3]
+                
+                mangas.add(SManga.create().apply {
+                    title = titleName
+                    url = folderId
+                    status = SManga.UNKNOWN
+                    thumbnail_url = getCoverUrlForManga(folderId)
+                })
             }
-            mangas.add(manga)
         }
         return MangasPage(mangas, false)
     }
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        checkPreferences()
-        val driveQuery = "'$rootFolderId' in parents and mimeType = 'application/vnd.google-apps.folder' and name contains '$query' and trashed = false"
-        val encodedQuery = URLEncoder.encode(driveQuery, "UTF-8")
-        val url = "$baseUrl?q=$encodedQuery&orderBy=name&fields=files(id,name)&key=$apiKey"
-        return GET(url, headers)
-    }
-
+    // Fungsi pencarian dimatikan sementara karena kita menggunakan Path List statis
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = popularMangaRequest(page)
     override fun searchMangaParse(response: Response): MangasPage = popularMangaParse(response)
 
+    // ==========================================================
+    // 2. BACA STRUKTUR FOLDER (Menggunakan API Key)
+    // ==========================================================
+    private fun getCoverUrlForManga(mangaFolderId: String): String {
+        return try {
+            val query = "'$mangaFolderId' in parents and mimeType contains 'image/' and trashed = false"
+            val encodedQuery = URLEncoder.encode(query, "UTF-8")
+            val url = "$apiUrl?q=$encodedQuery&pageSize=1&fields=files(id)&key=$apiKey"
+            
+            val request = GET(url, headers)
+            val res = client.newCall(request).execute()
+            val json = JSONObject(res.body!!.string())
+            val files = json.optJSONArray("files")
+            
+            if (files != null && files.length() > 0) {
+                val fileId = files.getJSONObject(0).getString("id")
+                // URL gambar menggunakan endpoint Google Drive web
+                "$baseUrl/uc?export=view&id=$fileId"
+            } else {
+                ""
+            }
+        } catch (e: Exception) { "" }
+    }
+
     override fun mangaDetailsRequest(manga: SManga): Request {
-        checkPreferences()
-        val url = "$baseUrl/${manga.url}?fields=id,name&key=$apiKey"
+        checkApiKey()
+        val url = "$apiUrl/${manga.url}?fields=id,name&key=$apiKey"
         return GET(url, headers)
     }
 
@@ -131,18 +133,18 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val json = JSONObject(response.body!!.string())
         return SManga.create().apply {
             title = json.getString("name")
-            description = "Manga di-streaming langsung dari Google Drive."
+            description = "Manga di-streaming dari Google Drive Anda.\nPastikan Anda sudah Login via WebView (Ikon Bola Dunia)."
             thumbnail_url = getCoverUrlForManga(json.getString("id"))
             initialized = true
         }
     }
 
     override fun chapterListRequest(manga: SManga): Request {
-        checkPreferences()
+        checkApiKey()
         val mangaFolderId = manga.url
         val query = "'$mangaFolderId' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val url = "$baseUrl?q=$encodedQuery&orderBy=name&fields=files(id,name)&key=$apiKey"
+        val url = "$apiUrl?q=$encodedQuery&orderBy=name&fields=files(id,name)&key=$apiKey"
         return GET(url, headers)
     }
 
@@ -163,12 +165,15 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         return chapters.reversed()
     }
 
+    // ==========================================================
+    // 3. STREAMING GAMBAR (MENGGUNAKAN WEBVIEW COOKIES)
+    // ==========================================================
     override fun pageListRequest(chapter: SChapter): Request {
-        checkPreferences()
+        checkApiKey()
         val chapterFolderId = chapter.url
         val query = "'$chapterFolderId' in parents and mimeType contains 'image/' and trashed = false"
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val url = "$baseUrl?q=$encodedQuery&orderBy=name&fields=files(id)&key=$apiKey"
+        val url = "$apiUrl?q=$encodedQuery&orderBy=name&fields=files(id)&key=$apiKey"
         return GET(url, headers)
     }
 
@@ -179,7 +184,8 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
         for (i in 0 until files.length()) {
             val fileId = files.getJSONObject(i).getString("id")
-            val imageUrl = "$baseUrl/$fileId?alt=media&key=$apiKey"
+            // Endpoint ini akan otomatis menggunakan cookies dari WebView Aniyomi
+            val imageUrl = "$baseUrl/uc?export=view&id=$fileId"
             pages.add(Page(i, imageUrl, imageUrl))
         }
         return pages
@@ -191,6 +197,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     companion object {
         private const val API_KEY_PREF = "API_KEY_PREF"
-        private const val FOLDER_ID_PREF = "ROOT_FOLDER_ID_PREF"
+        private const val PATH_LIST_PREF = "PATH_LIST_PREF"
     }
 }
