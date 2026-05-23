@@ -32,7 +32,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
     }
 
-    // Mengambil API Key secara dinamis dari pengaturan (bukan hardcode)
     private val apiKey: String
         get() = preferences.getString(API_KEY_PREF, "") ?: ""
 
@@ -43,7 +42,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val apiKeyPref = EditTextPreference(screen.context).apply {
             key = API_KEY_PREF
             title = "API Key Google Cloud"
-            summary = "Dibutuhkan untuk memindai susunan folder dengan cepat."
+            summary = "Dibutuhkan untuk memindai struktur folder dengan cepat."
             dialogTitle = "API Key"
         }
         screen.addPreference(apiKeyPref)
@@ -62,13 +61,34 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         if (pathList.isBlank()) throw Exception("Harap masukkan Path list di Pengaturan Ekstensi.")
     }
 
-    // ==========================================================
-    // 1. POPULAR MANGA (Membaca Isi Folder Utama dari Path List)
-    // ==========================================================
+    private fun getDescription(mangaFolderId: String): String {
+        return try {
+            val query = "'$mangaFolderId' in parents and name = 'description.txt' and trashed = false"
+            val encodedQuery = URLEncoder.encode(query, "UTF-8")
+            val url = "$apiUrl?q=$encodedQuery&pageSize=1&fields=files(id)&key=$apiKey"
+            
+            val request = GET(url, headers)
+            val res = client.newCall(request).execute()
+            val json = JSONObject(res.body!!.string())
+            val files = json.optJSONArray("files")
+            
+            if (files != null && files.length() > 0) {
+                val fileId = files.getJSONObject(0).getString("id")
+                val fileUrl = "$apiUrl/$fileId?alt=media&key=$apiKey"
+                val fileRequest = GET(fileUrl, headers)
+                val fileResponse = client.newCall(fileRequest).execute()
+                fileResponse.body!!.string()
+            } else {
+                "Manga di-streaming dari Google Drive.\nPastikan Anda sudah Login via WebView (Ikon Bola Dunia)."
+            }
+        } catch (e: Exception) {
+            "Manga di-streaming dari Google Drive."
+        }
+    }
+
     override fun popularMangaRequest(page: Int): Request {
         checkPreferences()
         val paths = pathList.split(";").map { it.trim() }.filter { it.isNotEmpty() }
-
         val parentQueries = mutableListOf<String>()
         val regex = Regex("folders/([a-zA-Z0-9_-]+)")
         
@@ -79,7 +99,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             }
         }
         
-        if (parentQueries.isEmpty()) throw Exception("URL Folder tidak valid. Pastikan URL Drive Anda benar.")
+        if (parentQueries.isEmpty()) throw Exception("URL Folder tidak valid.")
         
         val combinedParents = parentQueries.joinToString(" or ")
         val query = "($combinedParents) and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -110,9 +130,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = popularMangaRequest(page)
     override fun searchMangaParse(response: Response): MangasPage = popularMangaParse(response)
 
-    // ==========================================================
-    // 2. FUNGSI COVER & DETAIL MANGA
-    // ==========================================================
     private fun getCoverUrlForManga(mangaFolderId: String): String {
         return try {
             val query = "'$mangaFolderId' in parents and mimeType contains 'image/' and trashed = false"
@@ -139,17 +156,15 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     override fun mangaDetailsParse(response: Response): SManga {
         val json = JSONObject(response.body!!.string())
+        val mangaId = json.getString("id")
         return SManga.create().apply {
             title = json.getString("name")
-            description = "Manga di-streaming dari Google Drive.\nPastikan Anda sudah Login via WebView (Ikon Bola Dunia)."
-            thumbnail_url = getCoverUrlForManga(json.getString("id"))
+            description = getDescription(mangaId)
+            thumbnail_url = getCoverUrlForManga(mangaId)
             initialized = true
         }
     }
 
-    // ==========================================================
-    // 3. DAFTAR CHAPTER
-    // ==========================================================
     override fun chapterListRequest(manga: SManga): Request {
         checkPreferences()
         val mangaFolderId = manga.url
@@ -175,9 +190,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         return chapters.reversed()
     }
 
-    // ==========================================================
-    // 4. STREAMING HALAMAN
-    // ==========================================================
     override fun pageListRequest(chapter: SChapter): Request {
         checkPreferences()
         val chapterFolderId = chapter.url
