@@ -12,6 +12,7 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
+import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.Response
 import org.json.JSONObject
@@ -42,10 +43,8 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val apiKeyPref = EditTextPreference(screen.context).apply {
             key = API_KEY_PREF
             title = "API Key Google Cloud"
-            summary = "Gunakan API Key yang sudah dibatasi untuk Google Drive API."
         }
         screen.addPreference(apiKeyPref)
-
         val pathListPref = EditTextPreference(screen.context).apply {
             key = PATH_LIST_PREF
             title = "Path list"
@@ -81,7 +80,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             Regex("folders/([a-zA-Z0-9_-]+)").find(path)?.groupValues?.get(1)?.let { "'$it' in parents" }
         }
         if (queries.isEmpty()) throw Exception("URL Folder tidak valid.")
-        
         val url = "$apiUrl?q=${URLEncoder.encode("(${queries.joinToString(" or ")}) and mimeType = 'application/vnd.google-apps.folder' and trashed = false", "UTF-8")}&orderBy=name&fields=files(id,name)&key=$apiKey"
         return GET(url, headers)
     }
@@ -107,14 +105,12 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val json = JSONObject(response.body!!.string())
         val mangaId = json.getString("id")
         val metadata = getMetadata(mangaId)
-        
         val authorName = metadata.optString("author", "Unknown")
         val publisherName = metadata.optString("publisher", "")
         
         return SManga.create().apply {
             title = json.getString("name")
             description = metadata.optString("description", "Manga di-streaming dari Google Drive.")
-            // Gabungkan Author dan Publisher
             author = if (publisherName.isNotEmpty()) "$authorName | $publisherName" else authorName
             status = when (metadata.optInt("status", 0)) {
                 1 -> SManga.ONGOING
@@ -148,6 +144,15 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         }.reversed()
     }
 
+    // Memaksa Aniyomi tidak menyimpan cache untuk list halaman
+    override fun pageListRequest(chapter: SChapter): Request {
+        val newHeaders = headers.newBuilder()
+            .add("Cache-Control", "no-cache")
+            .build()
+        val url = "$apiUrl?q=${URLEncoder.encode("'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false", "UTF-8")}&orderBy=name&fields=files(id)&key=$apiKey"
+        return GET(url, newHeaders)
+    }
+
     override fun pageListParse(response: Response): List<Page> {
         val files = JSONObject(response.body!!.string()).optJSONArray("files") ?: return emptyList()
         return (0 until files.length()).map { i ->
@@ -156,7 +161,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     }
 
     override fun chapterListRequest(manga: SManga): Request = GET("$apiUrl?q=${URLEncoder.encode("'${manga.url}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false", "UTF-8")}&orderBy=name&fields=files(id,name)&key=$apiKey", headers)
-    override fun pageListRequest(chapter: SChapter): Request = GET("$apiUrl?q=${URLEncoder.encode("'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false", "UTF-8")}&orderBy=name&fields=files(id)&key=$apiKey", headers)
     override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiUrl/${manga.url}?fields=id,name&key=$apiKey", headers)
     override fun latestUpdatesRequest(page: Int): Request = throw Exception("Not used")
     override fun latestUpdatesParse(response: Response): MangasPage = throw Exception("Not used")
