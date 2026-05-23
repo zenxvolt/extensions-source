@@ -25,6 +25,7 @@ jobs:
       - name: Build APK
         run: |
           chmod +x gradlew
+          ./gradlew :src:id:googledrive:spotlessApply || true
           ./gradlew :src:id:googledrive:assembleDebug
 
       - name: Upload APK

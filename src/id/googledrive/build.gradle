@@ -1,6 +1,6 @@
 ext {
     extName = 'Google Drive'
-    pkgNameSuffix = 'id.googledrive'
+    pkgNameSuffix = 'googledrive'
     extClass = '.GoogleDrive'
     extVersionCode = 1
     isNsfw = false
