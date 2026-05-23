@@ -18,6 +18,9 @@ import org.json.JSONObject
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 
 class GoogleDrive : HttpSource(), ConfigurableSource {
 
@@ -37,12 +40,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     private val pathList: String
         get() = preferences.getString(PATH_LIST_PREF, "") ?: ""
-
-    private val noCacheHeaders by lazy {
-        headersBuilder()
-            .set("Cache-Control", "no-cache, no-store, must-revalidate")
-            .build()
-    }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val apiKeyPref = EditTextPreference(screen.context).apply {
@@ -64,22 +61,42 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         if (apiKey.isBlank() || pathList.isBlank()) throw Exception("API Key atau Path List belum diisi!")
     }
 
+    // Fungsi untuk mengubah format waktu Google Drive (RFC 3339) ke Milliseconds
+    private fun parseDate(dateStr: String?): Long {
+        if (dateStr.isNullOrEmpty()) return 0L
+        return try {
+            val format = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.getDefault()).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }
+            format.parse(dateStr)?.time ?: 0L
+        } catch (e: Exception) {
+            try {
+                val format = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.getDefault()).apply {
+                    timeZone = TimeZone.getTimeZone("UTC")
+                }
+                format.parse(dateStr)?.time ?: 0L
+            } catch (e2: Exception) {
+                0L
+            }
+        }
+    }
+
     private fun getMetadata(mangaFolderId: String): JSONObject {
         try {
             val query = "'$mangaFolderId' in parents and name = 'metadata.json' and trashed = false"
             val encodedQuery = URLEncoder.encode(query, "UTF-8")
             val url = "$apiUrl?q=$encodedQuery&pageSize=1&fields=files(id)&key=$apiKey"
             
-            val responseBody = client.newCall(GET(url, noCacheHeaders)).execute().body?.string() ?: return JSONObject()
+            val responseBody = client.newCall(GET(url, headers)).execute().body?.string() ?: return JSONObject()
             val files = JSONObject(responseBody).optJSONArray("files")
             
             if (files != null && files.length() > 0) {
                 val fileId = files.getJSONObject(0).getString("id")
-                val contentBody = client.newCall(GET("$apiUrl/$fileId?alt=media&key=$apiKey", noCacheHeaders)).execute().body?.string() ?: return JSONObject()
+                val contentBody = client.newCall(GET("$apiUrl/$fileId?alt=media&key=$apiKey", headers)).execute().body?.string() ?: return JSONObject()
                 return JSONObject(contentBody)
             }
         } catch (e: Exception) {
-            // Ignore error and fallback to empty JSONObject
+            // Abaikan error dan kembalikan JSON kosong
         }
         return JSONObject()
     }
@@ -97,7 +114,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
         val url = "$apiUrl?q=$encodedQuery&orderBy=name&fields=files(id,name)&key=$apiKey"
         
-        return GET(url, noCacheHeaders)
+        return GET(url, headers)
     }
 
     override fun popularMangaParse(response: Response): MangasPage {
@@ -149,7 +166,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             val encodedQuery = URLEncoder.encode(query, "UTF-8")
             val url = "$apiUrl?q=$encodedQuery&pageSize=1&fields=files(id)&key=$apiKey"
             
-            val responseBody = client.newCall(GET(url, noCacheHeaders)).execute().body?.string() ?: return ""
+            val responseBody = client.newCall(GET(url, headers)).execute().body?.string() ?: return ""
             val files = JSONObject(responseBody).optJSONArray("files")
             
             if (files != null && files.length() > 0) {
@@ -162,6 +179,13 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         }
     }
 
+    override fun chapterListRequest(manga: SManga): Request {
+        val query = "'${manga.url}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        val encodedQuery = URLEncoder.encode(query, "UTF-8")
+        // Meminta field modifiedTime untuk mendeteksi perubahan isi folder
+        return GET("$apiUrl?q=$encodedQuery&orderBy=name&fields=files(id,name,modifiedTime)&key=$apiKey", headers)
+    }
+
     override fun chapterListParse(response: Response): List<SChapter> {
         val responseBody = response.body?.string() ?: return emptyList()
         val files = JSONObject(responseBody).optJSONArray("files") ?: return emptyList()
@@ -172,8 +196,16 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
                 name = file.getString("name")
                 url = file.getString("id")
                 chapter_number = (i + 1).toFloat()
+                // Menyematkan waktu update folder ke date_upload
+                date_upload = parseDate(file.optString("modifiedTime"))
             }
         }.reversed()
+    }
+
+    override fun pageListRequest(chapter: SChapter): Request {
+        val query = "'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false"
+        val encodedQuery = URLEncoder.encode(query, "UTF-8")
+        return GET("$apiUrl?q=$encodedQuery&orderBy=name&fields=files(id)&key=$apiKey", headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
@@ -185,19 +217,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         }
     }
 
-    override fun chapterListRequest(manga: SManga): Request {
-        val query = "'${manga.url}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        return GET("$apiUrl?q=$encodedQuery&orderBy=name&fields=files(id,name)&key=$apiKey", noCacheHeaders)
-    }
-
-    override fun pageListRequest(chapter: SChapter): Request {
-        val query = "'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false"
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        return GET("$apiUrl?q=$encodedQuery&orderBy=name&fields=files(id)&key=$apiKey", noCacheHeaders)
-    }
-
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiUrl/${manga.url}?fields=id,name&key=$apiKey", noCacheHeaders)
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiUrl/${manga.url}?fields=id,name&key=$apiKey", headers)
 
     override fun latestUpdatesRequest(page: Int): Request = throw Exception("Not used")
     override fun latestUpdatesParse(response: Response): MangasPage = throw Exception("Not used")
