@@ -14,6 +14,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import okhttp3.Request
 import okhttp3.Response
+import org.json.JSONArray
 import org.json.JSONObject
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
@@ -31,10 +32,16 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     private val apiUrl = "https://www.googleapis.com/drive/v3/files"
 
-    // Field yang diminta ke API dibatasi seminimal mungkin agar response lebih kecil dan cepat.
-    // Tambahkan field hanya jika memang dibutuhkan.
-    private val listFields = "files(id,name)"
-    private val chapterFields = "files(id,name,modifiedTime)"
+    private val listFields = "nextPageToken,files(id,name)"
+    private val chapterFields = "nextPageToken,files(id,name,modifiedTime)"
+
+    // Google Drive API max pageSize adalah 1000.
+    // Dipakai untuk chapter list dan page list agar jarang butuh paginate.
+    private const val PAGE_SIZE_LARGE = 1000
+
+    // Untuk browse manga dipakai nilai lebih kecil agar setiap "halaman" Aniyomi
+    // tidak terlalu berat, dan navigasi halaman berikutnya tetap bisa dilakukan.
+    private const val PAGE_SIZE_BROWSE = 50
 
     private val preferences: SharedPreferences by lazy {
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
@@ -45,6 +52,13 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     private val pathList: String
         get() = preferences.getString(PATH_LIST_PREF, "") ?: ""
+
+    // Menyimpan pemetaan nomor halaman Aniyomi → nextPageToken Google Drive.
+    // Google Drive memakai cursor-based pagination, sedangkan Aniyomi memakai
+    // nomor halaman. Map ini menjembatani keduanya.
+    // Key = nomor halaman berikutnya (2, 3, …), Value = token dari Drive API.
+    private val browsePageTokens = mutableMapOf<Int, String>()
+    private var lastBrowseQuery = "" // Menyimpan query terakhir agar bisa dipakai saat fetch halaman berikutnya
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val apiKeyPref = EditTextPreference(screen.context).apply {
@@ -67,25 +81,15 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         if (pathList.isBlank()) throw Exception("Path List belum diisi di pengaturan extension!")
     }
 
-    // ─── Helper ──────────────────────────────────────────────────────────────
+    // ─── Helpers ─────────────────────────────────────────────────────────────
 
-    /**
-     * Mengekstrak folder ID dari URL Google Drive.
-     * Mendukung format: https://drive.google.com/drive/folders/FOLDER_ID
-     */
     private fun extractFolderId(path: String): String? =
         Regex("folders/([a-zA-Z0-9_-]+)").find(path)?.groupValues?.get(1)
 
-    /**
-     * Membuat klausa "in parents" untuk setiap folder yang dikonfigurasi.
-     * Digunakan bersama-sama dengan OR agar semua folder tercakup dalam satu query.
-     */
-    private fun buildParentClauses(): List<String> {
-        return pathList
-            .split(";")
+    private fun buildParentClauses(): List<String> =
+        pathList.split(";")
             .filter { it.isNotBlank() }
             .mapNotNull { path -> extractFolderId(path)?.let { "'$it' in parents" } }
-    }
 
     private fun parseDate(dateStr: String?): Long {
         if (dateStr.isNullOrEmpty()) return 0L
@@ -98,24 +102,89 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
                 SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.getDefault())
                     .apply { timeZone = TimeZone.getTimeZone("UTC") }
                     .parse(dateStr)?.time ?: 0L
-            } catch (e2: Exception) {
-                0L
-            }
+            } catch (e2: Exception) { 0L }
         }
     }
 
     /**
-     * Mengambil metadata.json dari folder manga.
-     * Dipanggil hanya saat mangaDetailsParse, bukan saat list/browse.
+     * Natural sort: membandingkan string dengan memisahkan bagian angka dan non-angka,
+     * sehingga "Chapter 2" < "Chapter 10" (bukan sebaliknya seperti pada sort alfabetis).
+     *
+     * Contoh urutan yang SALAH (lexicographic/Drive default):
+     * Chapter 1, Chapter 10, Chapter 11, Chapter 2, Chapter 3 …
+     *
+     * Contoh urutan yang BENAR (natural sort):
+     * Chapter 1, Chapter 2, Chapter 3 … Chapter 10, Chapter 11 …
      */
+    private fun naturalSortComparator(): Comparator<String> = Comparator { a, b ->
+        val tokensA = tokenize(a)
+        val tokensB = tokenize(b)
+        val len = minOf(tokensA.size, tokensB.size)
+        for (i in 0 until len) {
+            val ta = tokensA[i]
+            val tb = tokensB[i]
+            val cmp = if (ta.first().isDigit() && tb.first().isDigit()) {
+                ta.toBigInteger().compareTo(tb.toBigInteger())
+            } else {
+                ta.lowercase().compareTo(tb.lowercase())
+            }
+            if (cmp != 0) return@Comparator cmp
+        }
+        tokensA.size.compareTo(tokensB.size)
+    }
+
+    /** Memisahkan string menjadi segmen angka dan non-angka secara bergantian. */
+    private fun tokenize(s: String): List<String> =
+        Regex("(\\d+|\\D+)").findAll(s).map { it.value }.toList()
+
+    private fun buildApiUrl(
+        query: String,
+        orderBy: String = "name",
+        pageSize: Int = PAGE_SIZE_BROWSE,
+        fields: String = listFields,
+        pageToken: String? = null,
+    ): String {
+        val encodedQuery = URLEncoder.encode(query, "UTF-8")
+        val sb = StringBuilder(
+            "$apiUrl?q=$encodedQuery&orderBy=$orderBy&pageSize=$pageSize&fields=$fields&key=$apiKey",
+        )
+        if (pageToken != null) sb.append("&pageToken=${URLEncoder.encode(pageToken, "UTF-8")}")
+        return sb.toString()
+    }
+
+    /**
+     * Mengambil SEMUA file dari query tertentu dengan mengikuti nextPageToken
+     * secara otomatis hingga tidak ada halaman berikutnya.
+     *
+     * Digunakan untuk chapter list dan page list di mana kita butuh data lengkap
+     * sebelum bisa mengurutkan dan menomori chapter dengan benar.
+     */
+    private fun fetchAllFiles(query: String, orderBy: String = "name", fields: String): List<JSONObject> {
+        val result = mutableListOf<JSONObject>()
+        var pageToken: String? = null
+
+        do {
+            val url = buildApiUrl(query, orderBy, PAGE_SIZE_LARGE, fields, pageToken)
+            val body = client.newCall(GET(url, headers)).execute()
+                .body?.string() ?: break
+            val json = JSONObject(body)
+            val files: JSONArray = json.optJSONArray("files") ?: break
+            for (i in 0 until files.length()) result.add(files.getJSONObject(i))
+            pageToken = json.optString("nextPageToken").takeIf { it.isNotEmpty() }
+        } while (pageToken != null)
+
+        return result
+    }
+
+    // ─── Metadata & Cover ────────────────────────────────────────────────────
+
     private fun getMetadata(mangaFolderId: String): JSONObject {
         return try {
             val query = "'$mangaFolderId' in parents and name = 'metadata.json' and trashed = false"
             val url = buildApiUrl(query, pageSize = 1, fields = "files(id)")
-            val responseBody = client.newCall(GET(url, headers)).execute().body?.string()
-                ?: return JSONObject()
-            val files = JSONObject(responseBody).optJSONArray("files")
-                ?: return JSONObject()
+            val responseBody = client.newCall(GET(url, headers)).execute()
+                .body?.string() ?: return JSONObject()
+            val files = JSONObject(responseBody).optJSONArray("files") ?: return JSONObject()
 
             if (files.length() > 0) {
                 val fileId = files.getJSONObject(0).getString("id")
@@ -126,73 +195,38 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             } else {
                 JSONObject()
             }
-        } catch (e: Exception) {
-            JSONObject()
-        }
+        } catch (e: Exception) { JSONObject() }
     }
 
-    /**
-     * PERBAIKAN: Cover URL hanya diambil saat mangaDetailsParse.
-     * Tidak boleh dipanggil di dalam popularMangaParse/searchMangaParse
-     * karena akan membuat N request tambahan (1 per manga) yang memperlambat browse.
-     *
-     * Menggunakan query `name = 'cover.*'` agar lebih spesifik dan cepat
-     * dibanding mencari semua gambar di folder.
-     */
     private fun getCoverUrlForManga(mangaFolderId: String): String {
         return try {
-            // Prioritaskan file bernama cover.jpg/png/jpeg/webp (konvensi penamaan)
+            // Cari file cover.* terlebih dahulu (lebih cepat dan spesifik)
             val query = "'$mangaFolderId' in parents and trashed = false and " +
                 "(name = 'cover.jpg' or name = 'cover.jpeg' or name = 'cover.png' or name = 'cover.webp')"
             val url = buildApiUrl(query, pageSize = 1, fields = "files(id)")
-            val responseBody = client.newCall(GET(url, headers)).execute().body?.string()
-                ?: return fetchFirstImageAsCover(mangaFolderId)
+            val responseBody = client.newCall(GET(url, headers)).execute()
+                .body?.string() ?: return fetchFirstImageAsCover(mangaFolderId)
             val files = JSONObject(responseBody).optJSONArray("files")
 
             if (files != null && files.length() > 0) {
                 "$baseUrl/uc?export=view&id=${files.getJSONObject(0).getString("id")}"
             } else {
-                // Fallback: ambil gambar pertama apa pun di folder
                 fetchFirstImageAsCover(mangaFolderId)
             }
-        } catch (e: Exception) {
-            ""
-        }
+        } catch (e: Exception) { "" }
     }
 
-    /** Fallback cover: ambil gambar pertama di folder jika tidak ada file 'cover.*' */
     private fun fetchFirstImageAsCover(mangaFolderId: String): String {
         return try {
             val query = "'$mangaFolderId' in parents and mimeType contains 'image/' and trashed = false"
             val url = buildApiUrl(query, pageSize = 1, fields = "files(id)")
-            val responseBody = client.newCall(GET(url, headers)).execute().body?.string()
-                ?: return ""
+            val responseBody = client.newCall(GET(url, headers)).execute()
+                .body?.string() ?: return ""
             val files = JSONObject(responseBody).optJSONArray("files")
             if (files != null && files.length() > 0) {
                 "$baseUrl/uc?export=view&id=${files.getJSONObject(0).getString("id")}"
-            } else {
-                ""
-            }
-        } catch (e: Exception) {
-            ""
-        }
-    }
-
-    /**
-     * Helper terpusat untuk membangun URL API agar tidak ada duplikasi logika
-     * dan semua parameter (pageSize, fields, key) konsisten.
-     */
-    private fun buildApiUrl(
-        query: String,
-        orderBy: String = "name",
-        pageSize: Int = 100,
-        fields: String = listFields,
-        pageToken: String? = null,
-    ): String {
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val sb = StringBuilder("$apiUrl?q=$encodedQuery&orderBy=$orderBy&pageSize=$pageSize&fields=$fields&key=$apiKey")
-        if (pageToken != null) sb.append("&pageToken=$pageToken")
-        return sb.toString()
+            } else { "" }
+        } catch (e: Exception) { "" }
     }
 
     // ─── Browse / Popular ────────────────────────────────────────────────────
@@ -204,54 +238,63 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
         val joinedParents = parentClauses.joinToString(" or ")
         val query = "($joinedParents) and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        return GET(buildApiUrl(query), headers)
+
+        // Reset token map saat browse dari awal (halaman 1)
+        if (page == 1) {
+            browsePageTokens.clear()
+            lastBrowseQuery = query
+        }
+
+        val token = browsePageTokens[page]
+        return GET(buildApiUrl(query, pageToken = token), headers)
     }
 
     override fun popularMangaParse(response: Response): MangasPage {
         val body = response.body?.string() ?: return MangasPage(emptyList(), false)
-        val files = JSONObject(body).optJSONArray("files") ?: return MangasPage(emptyList(), false)
+        val json = JSONObject(body)
+        val files = json.optJSONArray("files") ?: return MangasPage(emptyList(), false)
+
+        // Simpan nextPageToken untuk halaman berikutnya
+        val nextToken = json.optString("nextPageToken").takeIf { it.isNotEmpty() }
+        val currentPage = browsePageTokens.size + 1
+        if (nextToken != null) {
+            browsePageTokens[currentPage + 1] = nextToken
+        }
 
         val mangas = (0 until files.length()).map { i ->
             val file = files.getJSONObject(i)
             SManga.create().apply {
                 title = file.getString("name")
                 url = file.getString("id")
-                // PERBAIKAN: thumbnail_url TIDAK diisi di sini.
-                // Mengisi thumbnail_url di sini berarti memanggil getCoverUrlForManga()
-                // sebanyak N kali secara sinkron → N HTTP request ekstra → browse jadi lambat.
-                // Cover akan dimuat saat pengguna membuka halaman detail manga.
-                thumbnail_url = null
+                thumbnail_url = null // Cover hanya dimuat saat detail dibuka
             }
         }
-        return MangasPage(mangas, false)
+        return MangasPage(mangas, hasNextPage = nextToken != null)
     }
 
     // ─── Search ──────────────────────────────────────────────────────────────
 
-    /**
-     * PERBAIKAN: Search kini benar-benar memfilter berdasarkan query string.
-     * Sebelumnya hanya memanggil popularMangaRequest dan mengabaikan query,
-     * sehingga semua entry selalu muncul.
-     */
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         checkPreferences()
         val parentClauses = buildParentClauses()
         if (parentClauses.isEmpty()) throw Exception("Tidak ada URL folder valid di Path List.")
 
         val joinedParents = parentClauses.joinToString(" or ")
-
-        // Jika query kosong, gunakan logika yang sama dengan popularMangaRequest
         val nameFilter = if (query.isNotBlank()) {
-            // Escape single quote agar tidak merusak sintaks query Google Drive API
             val safeQuery = query.replace("\\", "\\\\").replace("'", "\\'")
             " and name contains '$safeQuery'"
-        } else {
-            ""
-        }
+        } else { "" }
 
         val driveQuery = "($joinedParents) and mimeType = 'application/vnd.google-apps.folder'" +
             "$nameFilter and trashed = false"
-        return GET(buildApiUrl(driveQuery), headers)
+
+        if (page == 1) {
+            browsePageTokens.clear()
+            lastBrowseQuery = driveQuery
+        }
+
+        val token = browsePageTokens[page]
+        return GET(buildApiUrl(driveQuery, pageToken = token), headers)
     }
 
     override fun searchMangaParse(response: Response): MangasPage = popularMangaParse(response)
@@ -261,10 +304,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     override fun mangaDetailsRequest(manga: SManga): Request =
         GET("$apiUrl/${manga.url}?fields=id,name&key=$apiKey", headers)
 
-    /**
-     * Cover dan metadata baru diambil di sini, yaitu saat pengguna membuka
-     * halaman detail satu manga — bukan saat memuat seluruh daftar.
-     */
     override fun mangaDetailsParse(response: Response): SManga {
         val body = response.body?.string() ?: return SManga.create()
         val json = JSONObject(body)
@@ -284,50 +323,104 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
                 6 -> SManga.CANCELLED
                 else -> SManga.UNKNOWN
             }
-            // Cover diambil di sini: hanya 1 request per manga yang dibuka, bukan N request sekaligus
             thumbnail_url = getCoverUrlForManga(mangaId)
             initialized = true
         }
     }
 
+    // ─── State sementara untuk pagination chapter & page ─────────────────────
+    // Dibutuhkan karena Tachiyomi memisahkan Request dan Response parsing,
+    // sedangkan kita butuh query asli untuk fetch halaman berikutnya via pageToken.
+    // Aman untuk single-user app seperti Aniyomi.
+
+    private var currentChapterQuery = ""
+    private var currentPageQuery = ""
+
     // ─── Chapter List ────────────────────────────────────────────────────────
 
     override fun chapterListRequest(manga: SManga): Request {
-        val query = "'${manga.url}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        return GET(buildApiUrl(query, fields = chapterFields), headers)
+        val rawQuery = "'${manga.url}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        currentChapterQuery = "q=${URLEncoder.encode(rawQuery, "UTF-8")}&orderBy=name"
+        return GET(buildApiUrl(rawQuery, pageSize = PAGE_SIZE_LARGE, fields = chapterFields), headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val body = response.body?.string() ?: return emptyList()
-        val files = JSONObject(body).optJSONArray("files") ?: return emptyList()
-        val total = files.length()
+        val json = JSONObject(body)
 
-        return (0 until total).map { i ->
-            val file = files.getJSONObject(i)
+        // Kumpulkan semua file dari halaman pertama
+        val allFiles = mutableListOf<JSONObject>()
+        val firstBatch = json.optJSONArray("files") ?: return emptyList()
+        for (i in 0 until firstBatch.length()) allFiles.add(firstBatch.getJSONObject(i))
+
+        // Jika ada nextPageToken, ambil halaman-halaman berikutnya
+        var pageToken = json.optString("nextPageToken").takeIf { it.isNotEmpty() }
+        while (pageToken != null) {
+            val nextUrl = "$apiUrl?${currentChapterQuery}&pageSize=$PAGE_SIZE_LARGE&fields=$chapterFields&key=$apiKey&pageToken=${URLEncoder.encode(pageToken, "UTF-8")}"
+            val nextBody = client.newCall(GET(nextUrl, headers)).execute()
+                .body?.string() ?: break
+            val nextJson = JSONObject(nextBody)
+            val nextFiles = nextJson.optJSONArray("files") ?: break
+            for (i in 0 until nextFiles.length()) allFiles.add(nextFiles.getJSONObject(i))
+            pageToken = nextJson.optString("nextPageToken").takeIf { it.isNotEmpty() }
+        }
+
+        // PERBAIKAN URUTAN: Urutkan dengan natural sort sebelum memberi nomor.
+        val comparator = naturalSortComparator()
+        allFiles.sortWith { a, b -> comparator.compare(a.getString("name"), b.getString("name")) }
+
+        return allFiles.mapIndexed { i, file ->
             SChapter.create().apply {
                 name = file.getString("name")
                 url = file.getString("id")
-                // Nomor chapter dihitung dari belakang setelah reverse agar
-                // chapter terbaru (urutan atas) tetap mendapat nomor tertinggi
-                chapter_number = (total - i).toFloat()
+                // PERBAIKAN BUG MISSING ITEMS: (i + 1) karena urutan asli dari kecil ke besar
+                chapter_number = (i + 1).toFloat()
                 date_upload = parseDate(file.optString("modifiedTime"))
             }
-        }.reversed()
+        }.reversed() // Reverse agar chapter terbaru (angka terbesar) ada di paling atas
     }
 
     // ─── Page List ───────────────────────────────────────────────────────────
 
     override fun pageListRequest(chapter: SChapter): Request {
+        currentPageQuery = "q=${URLEncoder.encode("'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false", "UTF-8")}&orderBy=name"
         val query = "'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false"
-        return GET(buildApiUrl(query, fields = "files(id)"), headers)
+        // PERBAIKAN BUG GAMBAR ACAK: Tambahkan "name" ke dalam fields
+        return GET(buildApiUrl(query, pageSize = PAGE_SIZE_LARGE, fields = "nextPageToken,files(id,name)"), headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
         val body = response.body?.string() ?: return emptyList()
-        val files = JSONObject(body).optJSONArray("files") ?: return emptyList()
+        val json = JSONObject(body)
 
-        return (0 until files.length()).map { i ->
-            Page(i, "", "$baseUrl/uc?export=view&id=${files.getJSONObject(i).getString("id")}")
+        val allFiles = mutableListOf<JSONObject>()
+        val firstBatch = json.optJSONArray("files") ?: return emptyList()
+        for (i in 0 until firstBatch.length()) allFiles.add(firstBatch.getJSONObject(i))
+
+        // Ambil halaman berikutnya jika ada (untuk chapter dengan > 1000 gambar)
+        var pageToken = json.optString("nextPageToken").takeIf { it.isNotEmpty() }
+        while (pageToken != null) {
+            // PERBAIKAN BUG GAMBAR ACAK: Tambahkan "name" ke dalam fields juga di sini
+            val nextUrl = "$apiUrl?${currentPageQuery}&pageSize=$PAGE_SIZE_LARGE&fields=nextPageToken,files(id,name)&key=$apiKey&pageToken=${URLEncoder.encode(pageToken, "UTF-8")}"
+            val nextBody = client.newCall(GET(nextUrl, headers)).execute()
+                .body?.string() ?: break
+            val nextJson = JSONObject(nextBody)
+            val nextFiles = nextJson.optJSONArray("files") ?: break
+            for (i in 0 until nextFiles.length()) allFiles.add(nextFiles.getJSONObject(i))
+            pageToken = nextJson.optString("nextPageToken").takeIf { it.isNotEmpty() }
+        }
+
+        // PERBAIKAN BUG GAMBAR ACAK: Urutkan gambar berdasarkan nama file aslinya
+        val comparator = naturalSortComparator()
+        allFiles.sortWith { a, b ->
+            comparator.compare(
+                a.optString("name", a.optString("id")),
+                b.optString("name", b.optString("id"))
+            )
+        }
+
+        return allFiles.mapIndexed { i, file ->
+            Page(i, "", "$baseUrl/uc?export=view&id=${file.getString("id")}")
         }
     }
 
@@ -342,5 +435,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     companion object {
         private const val API_KEY_PREF = "API_KEY_PREF"
         private const val PATH_LIST_PREF = "PATH_LIST_PREF"
+        private const val PAGE_SIZE_LARGE = 1000
+        private const val PAGE_SIZE_BROWSE = 50
     }
 }
