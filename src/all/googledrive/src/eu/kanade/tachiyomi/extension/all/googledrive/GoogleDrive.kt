@@ -35,14 +35,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     private val listFields = "nextPageToken,files(id,name)"
     private val chapterFields = "nextPageToken,files(id,name,modifiedTime)"
 
-    // Google Drive API max pageSize adalah 1000.
-    // Dipakai untuk chapter list dan page list agar jarang butuh paginate.
-    private const val PAGE_SIZE_LARGE = 1000
-
-    // Untuk browse manga dipakai nilai lebih kecil agar setiap "halaman" Aniyomi
-    // tidak terlalu berat, dan navigasi halaman berikutnya tetap bisa dilakukan.
-    private const val PAGE_SIZE_BROWSE = 50
-
     private val preferences: SharedPreferences by lazy {
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
     }
@@ -54,11 +46,8 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         get() = preferences.getString(PATH_LIST_PREF, "") ?: ""
 
     // Menyimpan pemetaan nomor halaman Aniyomi → nextPageToken Google Drive.
-    // Google Drive memakai cursor-based pagination, sedangkan Aniyomi memakai
-    // nomor halaman. Map ini menjembatani keduanya.
-    // Key = nomor halaman berikutnya (2, 3, …), Value = token dari Drive API.
     private val browsePageTokens = mutableMapOf<Int, String>()
-    private var lastBrowseQuery = "" // Menyimpan query terakhir agar bisa dipakai saat fetch halaman berikutnya
+    private var lastBrowseQuery = ""
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val apiKeyPref = EditTextPreference(screen.context).apply {
@@ -106,16 +95,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         }
     }
 
-    /**
-     * Natural sort: membandingkan string dengan memisahkan bagian angka dan non-angka,
-     * sehingga "Chapter 2" < "Chapter 10" (bukan sebaliknya seperti pada sort alfabetis).
-     *
-     * Contoh urutan yang SALAH (lexicographic/Drive default):
-     * Chapter 1, Chapter 10, Chapter 11, Chapter 2, Chapter 3 …
-     *
-     * Contoh urutan yang BENAR (natural sort):
-     * Chapter 1, Chapter 2, Chapter 3 … Chapter 10, Chapter 11 …
-     */
     private fun naturalSortComparator(): Comparator<String> = Comparator { a, b ->
         val tokensA = tokenize(a)
         val tokensB = tokenize(b)
@@ -133,7 +112,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         tokensA.size.compareTo(tokensB.size)
     }
 
-    /** Memisahkan string menjadi segmen angka dan non-angka secara bergantian. */
     private fun tokenize(s: String): List<String> =
         Regex("(\\d+|\\D+)").findAll(s).map { it.value }.toList()
 
@@ -152,13 +130,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         return sb.toString()
     }
 
-    /**
-     * Mengambil SEMUA file dari query tertentu dengan mengikuti nextPageToken
-     * secara otomatis hingga tidak ada halaman berikutnya.
-     *
-     * Digunakan untuk chapter list dan page list di mana kita butuh data lengkap
-     * sebelum bisa mengurutkan dan menomori chapter dengan benar.
-     */
     private fun fetchAllFiles(query: String, orderBy: String = "name", fields: String): List<JSONObject> {
         val result = mutableListOf<JSONObject>()
         var pageToken: String? = null
@@ -200,7 +171,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     private fun getCoverUrlForManga(mangaFolderId: String): String {
         return try {
-            // Cari file cover.* terlebih dahulu (lebih cepat dan spesifik)
             val query = "'$mangaFolderId' in parents and trashed = false and " +
                 "(name = 'cover.jpg' or name = 'cover.jpeg' or name = 'cover.png' or name = 'cover.webp')"
             val url = buildApiUrl(query, pageSize = 1, fields = "files(id)")
@@ -239,7 +209,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val joinedParents = parentClauses.joinToString(" or ")
         val query = "($joinedParents) and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
 
-        // Reset token map saat browse dari awal (halaman 1)
         if (page == 1) {
             browsePageTokens.clear()
             lastBrowseQuery = query
@@ -254,7 +223,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val json = JSONObject(body)
         val files = json.optJSONArray("files") ?: return MangasPage(emptyList(), false)
 
-        // Simpan nextPageToken untuk halaman berikutnya
         val nextToken = json.optString("nextPageToken").takeIf { it.isNotEmpty() }
         val currentPage = browsePageTokens.size + 1
         if (nextToken != null) {
@@ -266,7 +234,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             SManga.create().apply {
                 title = file.getString("name")
                 url = file.getString("id")
-                thumbnail_url = null // Cover hanya dimuat saat detail dibuka
+                thumbnail_url = null
             }
         }
         return MangasPage(mangas, hasNextPage = nextToken != null)
@@ -329,9 +297,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     }
 
     // ─── State sementara untuk pagination chapter & page ─────────────────────
-    // Dibutuhkan karena Tachiyomi memisahkan Request dan Response parsing,
-    // sedangkan kita butuh query asli untuk fetch halaman berikutnya via pageToken.
-    // Aman untuk single-user app seperti Aniyomi.
 
     private var currentChapterQuery = ""
     private var currentPageQuery = ""
@@ -348,12 +313,10 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val body = response.body?.string() ?: return emptyList()
         val json = JSONObject(body)
 
-        // Kumpulkan semua file dari halaman pertama
         val allFiles = mutableListOf<JSONObject>()
         val firstBatch = json.optJSONArray("files") ?: return emptyList()
         for (i in 0 until firstBatch.length()) allFiles.add(firstBatch.getJSONObject(i))
 
-        // Jika ada nextPageToken, ambil halaman-halaman berikutnya
         var pageToken = json.optString("nextPageToken").takeIf { it.isNotEmpty() }
         while (pageToken != null) {
             val nextUrl = "$apiUrl?${currentChapterQuery}&pageSize=$PAGE_SIZE_LARGE&fields=$chapterFields&key=$apiKey&pageToken=${URLEncoder.encode(pageToken, "UTF-8")}"
@@ -365,7 +328,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             pageToken = nextJson.optString("nextPageToken").takeIf { it.isNotEmpty() }
         }
 
-        // PERBAIKAN URUTAN: Urutkan dengan natural sort sebelum memberi nomor.
         val comparator = naturalSortComparator()
         allFiles.sortWith { a, b -> comparator.compare(a.getString("name"), b.getString("name")) }
 
@@ -373,11 +335,10 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             SChapter.create().apply {
                 name = file.getString("name")
                 url = file.getString("id")
-                // PERBAIKAN BUG MISSING ITEMS: (i + 1) karena urutan asli dari kecil ke besar
                 chapter_number = (i + 1).toFloat()
                 date_upload = parseDate(file.optString("modifiedTime"))
             }
-        }.reversed() // Reverse agar chapter terbaru (angka terbesar) ada di paling atas
+        }.reversed()
     }
 
     // ─── Page List ───────────────────────────────────────────────────────────
@@ -385,7 +346,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     override fun pageListRequest(chapter: SChapter): Request {
         currentPageQuery = "q=${URLEncoder.encode("'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false", "UTF-8")}&orderBy=name"
         val query = "'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false"
-        // PERBAIKAN BUG GAMBAR ACAK: Tambahkan "name" ke dalam fields
         return GET(buildApiUrl(query, pageSize = PAGE_SIZE_LARGE, fields = "nextPageToken,files(id,name)"), headers)
     }
 
@@ -397,10 +357,8 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val firstBatch = json.optJSONArray("files") ?: return emptyList()
         for (i in 0 until firstBatch.length()) allFiles.add(firstBatch.getJSONObject(i))
 
-        // Ambil halaman berikutnya jika ada (untuk chapter dengan > 1000 gambar)
         var pageToken = json.optString("nextPageToken").takeIf { it.isNotEmpty() }
         while (pageToken != null) {
-            // PERBAIKAN BUG GAMBAR ACAK: Tambahkan "name" ke dalam fields juga di sini
             val nextUrl = "$apiUrl?${currentPageQuery}&pageSize=$PAGE_SIZE_LARGE&fields=nextPageToken,files(id,name)&key=$apiKey&pageToken=${URLEncoder.encode(pageToken, "UTF-8")}"
             val nextBody = client.newCall(GET(nextUrl, headers)).execute()
                 .body?.string() ?: break
@@ -410,7 +368,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             pageToken = nextJson.optString("nextPageToken").takeIf { it.isNotEmpty() }
         }
 
-        // PERBAIKAN BUG GAMBAR ACAK: Urutkan gambar berdasarkan nama file aslinya
         val comparator = naturalSortComparator()
         allFiles.sortWith { a, b ->
             comparator.compare(
