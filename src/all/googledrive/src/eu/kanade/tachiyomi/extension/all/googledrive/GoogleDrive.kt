@@ -71,7 +71,8 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         screen.addPreference(clientIdPref)
 
         val clientSecretPref = EditTextPreference(screen.context).apply {
-            key = clientSecretPref
+            // PERBAIKAN: Menggunakan konstanta CLIENT_SECRET_PREF yang benar
+            key = CLIENT_SECRET_PREF
             title = "Client Secret OAuth"
             summary = "Masukkan Client Secret proyek Google Cloud Console Anda."
         }
@@ -238,7 +239,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             val files = JSONObject(responseBody).optJSONArray("files")
 
             if (files != null && files.length() > 0) {
-                // Token disuntikkan langsung ke parameter URL agar mempermudah pemuat gambar internal Aniyomi
                 "$apiUrl/${files.getJSONObject(0).getString("id")}?alt=media&access_token=${getValidAccessToken()}"
             } else {
                 fetchFirstImageAsCover(mangaFolderId)
@@ -437,7 +437,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         }
 
         return allFiles.mapIndexed { i, file ->
-            // Menggunakan parameter access_token di URL agar Glide/internal downloader Aniyomi dapat memuat data mentah privat tanpa cookie
             Page(i, "", "$apiUrl/${file.getString("id")}?alt=media&access_token=${getValidAccessToken()}")
         }
     }
