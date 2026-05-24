@@ -179,7 +179,8 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             val files = JSONObject(responseBody).optJSONArray("files")
 
             if (files != null && files.length() > 0) {
-                "$baseUrl/uc?export=view&id=${files.getJSONObject(0).getString("id")}"
+                // DIUBAH: Menggunakan URL API resmi dengan alt=media + API Key
+                "$apiUrl/${files.getJSONObject(0).getString("id")}?alt=media&key=$apiKey"
             } else {
                 fetchFirstImageAsCover(mangaFolderId)
             }
@@ -194,7 +195,8 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
                 .body?.string() ?: return ""
             val files = JSONObject(responseBody).optJSONArray("files")
             if (files != null && files.length() > 0) {
-                "$baseUrl/uc?export=view&id=${files.getJSONObject(0).getString("id")}"
+                // DIUBAH: Menggunakan URL API resmi dengan alt=media + API Key
+                "$apiUrl/${files.getJSONObject(0).getString("id")}?alt=media&key=$apiKey"
             } else { "" }
         } catch (e: Exception) { "" }
     }
@@ -377,7 +379,8 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         }
 
         return allFiles.mapIndexed { i, file ->
-            Page(i, "", "$baseUrl/uc?export=view&id=${file.getString("id")}")
+            // DIUBAH: Halaman komik langsung memuat data mentah via API Key (alt=media), bebas dari WebView Cookies
+            Page(i, "", "$apiUrl/${file.getString("id")}?alt=media&key=$apiKey")
         }
     }
 
