@@ -55,6 +55,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     @Volatile
     private var accessToken: String? = null
+
     @Volatile
     private var tokenExpiresAt: Long = 0L
 
@@ -71,7 +72,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         screen.addPreference(clientIdPref)
 
         val clientSecretPref = EditTextPreference(screen.context).apply {
-            // PERBAIKAN: Menggunakan konstanta CLIENT_SECRET_PREF yang benar
             key = CLIENT_SECRET_PREF
             title = "Client Secret OAuth"
             summary = "Masukkan Client Secret proyek Google Cloud Console Anda."
@@ -105,8 +105,8 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     @Synchronized
     private fun getValidAccessToken(): String {
         val now = System.currentTimeMillis()
-        // Jika token sudah ada dan belum kedaluwarsa (diberi buffer aman 1 menit), gunakan token cache
-        if (accessToken != null && now < tokenExpiresAt - 60000) {
+        // Jika token sudah ada dan belum kedaluwarsa (buffer aman 1 menit), gunakan token cache
+        if (accessToken != null && now < tokenExpiresAt - 60_000) {
             return accessToken!!
         }
 
@@ -229,6 +229,8 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         } catch (e: Exception) { JSONObject() }
     }
 
+    // FIX: Simpan URL bersih tanpa access_token.
+    // Token akan di-inject secara fresh oleh imageRequest() setiap kali gambar di-load.
     private fun getCoverUrlForManga(mangaFolderId: String): String {
         return try {
             val query = "'$mangaFolderId' in parents and trashed = false and " +
@@ -239,7 +241,8 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             val files = JSONObject(responseBody).optJSONArray("files")
 
             if (files != null && files.length() > 0) {
-                "$apiUrl/${files.getJSONObject(0).getString("id")}?alt=media&access_token=${getValidAccessToken()}"
+                // FIX: URL bersih tanpa access_token — token di-inject via imageRequest()
+                "$apiUrl/${files.getJSONObject(0).getString("id")}?alt=media"
             } else {
                 fetchFirstImageAsCover(mangaFolderId)
             }
@@ -254,7 +257,8 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
                 .body?.string() ?: return ""
             val files = JSONObject(responseBody).optJSONArray("files")
             if (files != null && files.length() > 0) {
-                "$apiUrl/${files.getJSONObject(0).getString("id")}?alt=media&access_token=${getValidAccessToken()}"
+                // FIX: URL bersih tanpa access_token — token di-inject via imageRequest()
+                "$apiUrl/${files.getJSONObject(0).getString("id")}?alt=media"
             } else { "" }
         } catch (e: Exception) { "" }
     }
@@ -379,7 +383,9 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
         var pageToken = json.optString("nextPageToken").takeIf { it.isNotEmpty() }
         while (pageToken != null) {
-            val nextUrl = "$apiUrl?${currentChapterQuery}&pageSize=$PAGE_SIZE_LARGE&fields=$chapterFields&pageToken=${URLEncoder.encode(pageToken, "UTF-8")}"
+            val nextUrl = "$apiUrl?${currentChapterQuery}&pageSize=$PAGE_SIZE_LARGE" +
+                "&fields=$chapterFields" +
+                "&pageToken=${URLEncoder.encode(pageToken, "UTF-8")}"
             val nextBody = client.newCall(GET(nextUrl, getAuthHeaders())).execute()
                 .body?.string() ?: break
             val nextJson = JSONObject(nextBody)
@@ -419,7 +425,9 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
         var pageToken = json.optString("nextPageToken").takeIf { it.isNotEmpty() }
         while (pageToken != null) {
-            val nextUrl = "$apiUrl?${currentPageQuery}&pageSize=$PAGE_SIZE_LARGE&fields=nextPageToken,files(id,name)&pageToken=${URLEncoder.encode(pageToken, "UTF-8")}"
+            val nextUrl = "$apiUrl?${currentPageQuery}&pageSize=$PAGE_SIZE_LARGE" +
+                "&fields=nextPageToken,files(id,name)" +
+                "&pageToken=${URLEncoder.encode(pageToken, "UTF-8")}"
             val nextBody = client.newCall(GET(nextUrl, getAuthHeaders())).execute()
                 .body?.string() ?: break
             val nextJson = JSONObject(nextBody)
@@ -432,20 +440,37 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         allFiles.sortWith { a, b ->
             comparator.compare(
                 a.optString("name", a.optString("id")),
-                b.optString("name", b.optString("id"))
+                b.optString("name", b.optString("id")),
             )
         }
 
+        // FIX: Simpan URL bersih TANPA access_token.
+        // Token akan selalu di-inject secara fresh oleh imageRequest() saat gambar benar-benar dimuat.
+        // Ini mencegah error 403 akibat token yang sudah kedaluwarsa setelah ±1 jam.
         return allFiles.mapIndexed { i, file ->
-            Page(i, "", "$apiUrl/${file.getString("id")}?alt=media&access_token=${getValidAccessToken()}")
+            Page(i, "", "$apiUrl/${file.getString("id")}?alt=media")
         }
+    }
+
+    // ─── FIX: Image Request ──────────────────────────────────────────────────
+
+    // Dipanggil oleh Tachiyomi/Aniyomi setiap kali hendak memuat sebuah gambar.
+    // Dengan meng-override ini, kita memastikan Authorization header (Bearer token)
+    // selalu fresh dan valid — token di-cache oleh getValidAccessToken() dan hanya
+    // di-refresh ke Google jika sudah hampir kedaluwarsa.
+    override fun imageRequest(page: Page): Request {
+        return GET(page.imageUrl!!, getAuthHeaders())
     }
 
     // ─── Unused ──────────────────────────────────────────────────────────────
 
     override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException("Not used")
     override fun latestUpdatesParse(response: Response): MangasPage = throw UnsupportedOperationException("Not used")
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException("Not used")
+
+    // FIX: Tidak akan dipanggil karena imageUrl selalu di-set di pageListParse(),
+    // tapi diperbaiki agar tidak crash jika suatu saat dipanggil oleh framework.
+    override fun imageUrlParse(response: Response): String =
+        response.request.url.toString()
 
     // ─── Constants ───────────────────────────────────────────────────────────
 
