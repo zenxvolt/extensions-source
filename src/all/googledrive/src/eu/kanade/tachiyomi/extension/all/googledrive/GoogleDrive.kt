@@ -45,7 +45,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     private val pathList: String
         get() = preferences.getString(PATH_LIST_PREF, "") ?: ""
 
-    // Menyimpan pemetaan nomor halaman Aniyomi → nextPageToken Google Drive.
     private val browsePageTokens = mutableMapOf<Int, String>()
     private var lastBrowseQuery = ""
 
@@ -130,23 +129,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         return sb.toString()
     }
 
-    private fun fetchAllFiles(query: String, orderBy: String = "name", fields: String): List<JSONObject> {
-        val result = mutableListOf<JSONObject>()
-        var pageToken: String? = null
-
-        do {
-            val url = buildApiUrl(query, orderBy, PAGE_SIZE_LARGE, fields, pageToken)
-            val body = client.newCall(GET(url, headers)).execute()
-                .body?.string() ?: break
-            val json = JSONObject(body)
-            val files: JSONArray = json.optJSONArray("files") ?: break
-            for (i in 0 until files.length()) result.add(files.getJSONObject(i))
-            pageToken = json.optString("nextPageToken").takeIf { it.isNotEmpty() }
-        } while (pageToken != null)
-
-        return result
-    }
-
     // ─── Metadata & Cover ────────────────────────────────────────────────────
 
     private fun getComicInfoXml(mangaFolderId: String): String {
@@ -159,9 +141,11 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
             if (files.length() > 0) {
                 val fileId = files.getJSONObject(0).getString("id")
-                client.newCall(
+                // Mengambil string data (isi XML) secara eksplisit dari API Google Drive
+                val response = client.newCall(
                     GET("$apiUrl/$fileId?alt=media&key=$apiKey", headers),
-                ).execute().body?.string() ?: ""
+                ).execute()
+                response.body?.string() ?: ""
             } else {
                 ""
             }
@@ -169,8 +153,12 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     }
 
     private fun extractXmlTag(xml: String, tag: String): String? {
-        val regex = Regex("<$tag[^>]*>(.*?)</$tag>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
-        return regex.find(xml)?.groupValues?.get(1)?.trim()
+        // Regex diperbarui untuk mentoleransi namespace "ty:" dan atribut XML (seperti xmlns:ty=...)
+        val regex = Regex(
+            "<(?:\\w+:)?$tag(?:\\s+[^>]*)?>(.*?)</(?:\\w+:)?$tag>",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
+        return regex.find(xml)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotBlank() }
     }
 
     private fun parseComicInfo(xml: String, manga: SManga) {
@@ -178,20 +166,40 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             ?.replace("&amp;", "&")
             ?.replace("&lt;", "<")
             ?.replace("&gt;", ">")
+        
         val writer = extractXmlTag(xml, "Writer")
+        val penciller = extractXmlTag(xml, "Penciller")
         val publisher = extractXmlTag(xml, "Publisher")
-        val statusStr = extractXmlTag(xml, "Status")
+
+        // Memeriksa status baik dari format Tachiyomi custom ataupun standard Status
+        val statusStr = extractXmlTag(xml, "PublishingStatusTachiyomi") ?: extractXmlTag(xml, "Status")
         val genre = extractXmlTag(xml, "Genre")
+        val categories = extractXmlTag(xml, "Categories")
 
         manga.description = summary ?: "Tidak ada deskripsi."
-        manga.author = listOfNotNull(writer, publisher.takeIf { !it.isNullOrBlank() })
-            .joinToString(" | ")
-            .takeIf { it.isNotBlank() } ?: "Unknown"
-        manga.genre = genre
+
+        // Gabungkan list author/artist/publisher dan hilangkan tag yang kosong atau duplikat
+        val authorsList = listOfNotNull(writer, penciller, publisher).distinct()
+        manga.author = authorsList.joinToString(" | ").takeIf { it.isNotBlank() } ?: "Unknown"
+        
+        // Memasukkan artist ke dalam variabel sendiri jika didukung oleh Aniyomi
+        manga.artist = penciller ?: writer ?: "Unknown"
+
+        // Gabungkan tag <Genre> biasa dengan <ty:Categories> agar menjadi array genre Tachiyomi
+        val allGenres = listOfNotNull(genre, categories)
+            .flatMap { it.split(",") }
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            
+        if (allGenres.isNotEmpty()) {
+            manga.genre = allGenres.joinToString(", ")
+        }
+
         manga.status = when (statusStr?.lowercase()) {
-            "ongoing" -> SManga.ONGOING
-            "completed", "end" -> SManga.COMPLETED
-            "cancelled", "abandoned" -> SManga.CANCELLED
+            "ongoing", "1" -> SManga.ONGOING
+            "completed", "end", "2" -> SManga.COMPLETED
+            "cancelled", "abandoned", "6" -> SManga.CANCELLED
             "hiatus" -> SManga.ON_HIATUS
             else -> SManga.UNKNOWN
         }
@@ -216,7 +224,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     private fun fetchFirstImageAsCover(mangaFolderId: String): String {
         return try {
-            // Ditambahkan fileExtension = 'avif' untuk antisipasi jika mimetype avif tidak diset sebagai image oleh Google
             val query = "'$mangaFolderId' in parents and (mimeType contains 'image/' or fileExtension = 'avif' or name contains '.avif') and trashed = false"
             val url = buildApiUrl(query, pageSize = 1, fields = "files(id)")
             val responseBody = client.newCall(GET(url, headers)).execute()
@@ -372,7 +379,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     // ─── Page List ───────────────────────────────────────────────────────────
 
     override fun pageListRequest(chapter: SChapter): Request {
-        // Ditambahkan fileExtension = 'avif' atau pencarian nama file untuk menjaring AVIF yang tidak masuk ke mimeType image
         val query = "'${chapter.url}' in parents and (mimeType contains 'image/' or fileExtension = 'avif' or name contains '.avif') and trashed = false"
         currentPageQuery = "q=${URLEncoder.encode(query, "UTF-8")}&orderBy=name"
         return GET(buildApiUrl(query, pageSize = PAGE_SIZE_LARGE, fields = "nextPageToken,files(id,name)"), headers)
