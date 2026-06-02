@@ -264,7 +264,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     private fun fetchFirstImageAsCover(mangaFolderId: String): String {
         return try {
-            // STRATEGI 1: Cari file gambar langsung di folder utama manga
             val query = "'$mangaFolderId' in parents and (mimeType contains 'image/' or fileExtension = 'avif' or name contains '.avif') and trashed = false"
             val url = buildApiUrl(query, pageSize = 1, fields = "files(id)")
             val responseBody = client.newCall(createCleanGet(url)).execute().body?.string() ?: ""
@@ -274,7 +273,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
                 return "$baseUrl/uc?export=view&id=${files.getJSONObject(0).getString("id")}"
             }
 
-            // STRATEGI 2 (Deep Fallback): Cari folder chapter pertama, lalu ambil gambar pertama di dalamnya
             val subFolderQuery = "'$mangaFolderId' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
             val subFolderUrl = buildApiUrl(subFolderQuery, orderBy = "name", pageSize = 1, fields = "files(id)")
             val subFolderResponseBody = client.newCall(createCleanGet(subFolderUrl)).execute().body?.string() ?: ""
@@ -326,13 +324,93 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             browsePageTokens[currentPage + 1] = nextToken
         }
 
-        val mangas = (0 until files.length()).map { i ->
-            val file = files.getJSONObject(i)
+        val mangaFolders = (0 until files.length()).map { files.getJSONObject(it) }
+        val mangaIds = mangaFolders.map { it.getString("id") }
+
+        // Map akhir untuk menampung hubungan: mangaId -> coverUrl
+        val coverMap = mutableMapOf<String, String>()
+
+        if (mangaIds.isNotEmpty()) {
+            // STEP 1: Mengambil subfolder (chapter) pertama milik seluruh manga secara BATCH (dibagi kelompok per 25 item agar URL aman)
+            val mangaToChapterMap = mutableMapOf<String, String>() // mangaId -> firstChapterId
+            
+            mangaIds.chunked(25).forEach { chunk ->
+                val parentClauses = chunk.joinToString(" or ") { "'$it' in parents" }
+                val query = "($parentClauses) and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+                val url = buildApiUrl(query, orderBy = "name", pageSize = 1000, fields = "files(id,parents)")
+                try {
+                    val resBody = client.newCall(createCleanGet(url)).execute().body?.string() ?: ""
+                    val subFolders = JSONObject(resBody).optJSONArray("files")
+                    if (subFolders != null) {
+                        for (j in 0 until subFolders.length()) {
+                            val folderObj = subFolders.getJSONObject(j)
+                            val chId = folderObj.getString("id")
+                            val parentsArr = folderObj.optJSONArray("parents") ?: continue
+                            for (p in 0 until parentsArr.length()) {
+                                val mId = parentsArr.getString(p)
+                                // Karena data urut abjad nama folder, entri pertama otomatis menjadi Chapter terlama/terawal
+                                if (!mangaToChapterMap.containsKey(mId)) {
+                                    mangaToChapterMap[mId] = chId
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {}
+            }
+
+            // STEP 2: Mengambil berkas gambar pertama dari daftar ID Chapter yang didapat secara BATCH
+            val chapterIds = mangaToChapterMap.values.distinct()
+            val chapterToCoverMap = mutableMapOf<String, String>() // chapterId -> coverUrl
+
+            if (chapterIds.isNotEmpty()) {
+                chapterIds.chunked(25).forEach { chunk ->
+                    val parentClauses = chunk.joinToString(" or ") { "'$it' in parents" }
+                    val query = "($parentClauses) and (mimeType contains 'image/' or fileExtension = 'avif' or name contains '.avif' or name contains 'cover') and trashed = false"
+                    val url = buildApiUrl(query, orderBy = "name", pageSize = 1000, fields = "files(id,name,parents)")
+                    try {
+                        val resBody = client.newCall(createCleanGet(url)).execute().body?.string() ?: ""
+                        val imgFiles = JSONObject(resBody).optJSONArray("files")
+                        if (imgFiles != null) {
+                            for (j in 0 until imgFiles.length()) {
+                                val imgObj = imgFiles.getJSONObject(j)
+                                val imgId = imgObj.getString("id")
+                                val imgName = imgObj.optString("name", "")
+                                val parentsArr = imgObj.optJSONArray("parents") ?: continue
+                                val imgUrl = "$baseUrl/uc?export=view&id=$imgId"
+
+                                for (p in 0 until parentsArr.length()) {
+                                    val chId = parentsArr.getString(p)
+                                    val isExplicitCover = imgName.startsWith("cover.", ignoreCase = true)
+                                    // Berikan prioritas tinggi jika ada file bernama "cover.*", jika tidak ada gunakan gambar urutan pertama (.001 / .avif)
+                                    if (isExplicitCover || !chapterToCoverMap.containsKey(chId)) {
+                                        chapterToCoverMap[chId] = imgUrl
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {}
+                }
+            }
+
+            // STEP 3: Rekonstruksi relasi dari Manga ID -> Chapter ID -> URL Gambar Cover
+            for (mId in mangaIds) {
+                val chId = mangaToChapterMap[mId]
+                if (chId != null) {
+                    val cUrl = chapterToCoverMap[chId]
+                    if (cUrl != null) {
+                        coverMap[mId] = cUrl
+                    }
+                }
+            }
+        }
+
+        // Susun data manga dan injeksikan URL cover yang sudah dikumpulkan secara kilat di atas
+        val mangas = mangaFolders.map { file ->
+            val mId = file.getString("id")
             SManga.create().apply {
                 title = file.getString("name")
-                url = file.getString("id")
-                // PERBAIKAN: Mengambil cover secara dinamis agar langsung tampil di list browser ekstensi
-                thumbnail_url = getCoverUrlForManga(file.getString("id"))
+                url = mId
+                thumbnail_url = coverMap[mId]
             }
         }
         return MangasPage(mangas, hasNextPage = nextToken != null)
@@ -491,5 +569,4 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         private const val PATH_LIST_PREF = "PATH_LIST_PREF"
         private const val PAGE_SIZE_LARGE = 1000
         private const val PAGE_SIZE_BROWSE = 50
-    }
-}
+   PAGE_
