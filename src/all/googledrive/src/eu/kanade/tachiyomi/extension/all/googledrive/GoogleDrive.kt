@@ -90,9 +90,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
                 SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.getDefault())
                     .apply { timeZone = TimeZone.getTimeZone("UTC") }
                     .parse(dateStr)?.time ?: 0L
-            } catch (e2: Exception) { 
-                0L 
-            }
+            } catch (e2: Exception) { 0L }
         }
     }
 
@@ -131,6 +129,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         return sb.toString()
     }
 
+    // Melakukan request bersih untuk menghindari pemblokiran Google API akibat modifikasi headers
     private fun createCleanGet(url: String): Request {
         return Request.Builder()
             .url(url)
@@ -142,9 +141,11 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     private fun getComicInfoXml(mangaFolderId: String): String {
         return try {
+            // 1. Strategi Pertama: Cari langsung di folder utama manga
             var xmlContent = findAndDownloadComicInfo(mangaFolderId)
             if (xmlContent.isNotBlank()) return xmlContent
 
+            // 2. Strategi Kedua: Jika tidak ada, cari di dalam subfolder (misal folder chapter di dalam folder manga)
             val subFolderQuery = "'$mangaFolderId' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
             val subFolderUrl = buildApiUrl(subFolderQuery, pageSize = 5, fields = "files(id)")
             val subFolderResponseBody = client.newCall(createCleanGet(subFolderUrl)).execute().body?.string() ?: ""
@@ -158,9 +159,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
                 }
             }
             ""
-        } catch (e: Exception) { 
-            "" 
-        }
+        } catch (e: Exception) { "" }
     }
 
     private fun findAndDownloadComicInfo(folderId: String): String {
@@ -176,6 +175,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
                 if (fileName.equals("comicinfo.xml", ignoreCase = true)) {
                     val fileId = file.getString("id")
 
+                    // Jalur Utama: API resmi dengan parameter alt=media (Paling aman untuk data teks terenkripsi API Key)
                     val apiUrlDownload = "$apiUrl/$fileId?alt=media&key=$apiKey"
                     val res1 = client.newCall(createCleanGet(apiUrlDownload)).execute()
                     if (res1.isSuccessful) {
@@ -183,6 +183,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
                         if (content.contains("<ComicInfo", ignoreCase = true)) return content
                     }
 
+                    // Jalur Cadangan: Web download view link jika jalur API terhambat limit/permission
                     val webDownloadUrl = "$baseUrl/uc?export=download&id=$fileId"
                     val res2 = client.newCall(createCleanGet(webDownloadUrl)).execute()
                     if (res2.isSuccessful) {
@@ -191,9 +192,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
                     }
                 }
             }
-        } catch (e: Exception) { 
-            return ""
-        }
+        } catch (e: Exception) { }
         return ""
     }
 
@@ -256,7 +255,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             val query = "'$mangaFolderId' in parents and trashed = false and " +
                 "(name = 'cover.jpg' or name = 'cover.jpeg' or name = 'cover.png' or name = 'cover.webp' or name = 'cover.avif')"
             val url = buildApiUrl(query, pageSize = 1, fields = "files(id)")
-            val responseBody = client.newCall(createCleanGet(url)).execute()
+            val responseBody = client.newCall(GET(url, headers)).execute()
                 .body?.string() ?: return fetchFirstImageAsCover(mangaFolderId)
             val files = JSONObject(responseBody).optJSONArray("files")
 
@@ -265,43 +264,20 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             } else {
                 fetchFirstImageAsCover(mangaFolderId)
             }
-        } catch (e: Exception) { 
-            "" 
-        }
+        } catch (e: Exception) { "" }
     }
 
     private fun fetchFirstImageAsCover(mangaFolderId: String): String {
         return try {
             val query = "'$mangaFolderId' in parents and (mimeType contains 'image/' or fileExtension = 'avif' or name contains '.avif') and trashed = false"
             val url = buildApiUrl(query, pageSize = 1, fields = "files(id)")
-            val responseBody = client.newCall(createCleanGet(url)).execute().body?.string() ?: ""
+            val responseBody = client.newCall(GET(url, headers)).execute()
+                .body?.string() ?: return ""
             val files = JSONObject(responseBody).optJSONArray("files")
-            
             if (files != null && files.length() > 0) {
-                return "$baseUrl/uc?export=view&id=${files.getJSONObject(0).getString("id")}"
-            }
-
-            val subFolderQuery = "'$mangaFolderId' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-            val subFolderUrl = buildApiUrl(subFolderQuery, orderBy = "name", pageSize = 1, fields = "files(id)")
-            val subFolderResponseBody = client.newCall(createCleanGet(subFolderUrl)).execute().body?.string() ?: ""
-            val subFolders = JSONObject(subFolderResponseBody).optJSONArray("files")
-
-            if (subFolders != null && subFolders.length() > 0) {
-                val firstChapterFolderId = subFolders.getJSONObject(0).getString("id")
-                
-                val imgQuery = "'$firstChapterFolderId' in parents and (mimeType contains 'image/' or fileExtension = 'avif' or name contains '.avif') and trashed = false"
-                val imgUrl = buildApiUrl(imgQuery, orderBy = "name", pageSize = 1, fields = "files(id)")
-                val imgResponseBody = client.newCall(createCleanGet(imgUrl)).execute().body?.string() ?: ""
-                val imgFiles = JSONObject(imgResponseBody).optJSONArray("files")
-                
-                if (imgFiles != null && imgFiles.length() > 0) {
-                    return "$baseUrl/uc?export=view&id=${imgFiles.getJSONObject(0).getString("id")}"
-                }
-            }
-            ""
-        } catch (e: Exception) { 
-            "" 
-        }
+                "$baseUrl/uc?export=view&id=${files.getJSONObject(0).getString("id")}"
+            } else { "" }
+        } catch (e: Exception) { "" }
     }
 
     // ─── Browse / Popular ────────────────────────────────────────────────────
@@ -339,8 +315,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             SManga.create().apply {
                 title = file.getString("name")
                 url = file.getString("id")
-                // Lazy loading: Jangan proses thumbnail disini agar browsing super cepat
-                thumbnail_url = null 
+                thumbnail_url = null
             }
         }
         return MangasPage(mangas, hasNextPage = nextToken != null)
@@ -357,9 +332,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val nameFilter = if (query.isNotBlank()) {
             val safeQuery = query.replace("\\", "\\\\").replace("'", "\\'")
             " and name contains '$safeQuery'"
-        } else { 
-            "" 
-        }
+        } else { "" }
 
         val driveQuery = "($joinedParents) and mimeType = 'application/vnd.google-apps.folder'" +
             "$nameFilter and trashed = false"
@@ -387,7 +360,6 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
         val manga = SManga.create().apply {
             title = json.getString("name")
-            // Pengambilan Cover difokuskan disini (Saat user pertama kali menekan komik)
             thumbnail_url = getCoverUrlForManga(mangaId)
             initialized = true
         }
