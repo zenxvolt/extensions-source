@@ -149,38 +149,65 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     // ─── Metadata & Cover ────────────────────────────────────────────────────
 
-    private fun getMetadata(mangaFolderId: String): JSONObject {
+    private fun getComicInfoXml(mangaFolderId: String): String {
         return try {
-            val query = "'$mangaFolderId' in parents and name = 'metadata.json' and trashed = false"
+            val query = "'$mangaFolderId' in parents and name = 'ComicInfo.xml' and trashed = false"
             val url = buildApiUrl(query, pageSize = 1, fields = "files(id)")
             val responseBody = client.newCall(GET(url, headers)).execute()
-                .body?.string() ?: return JSONObject()
-            val files = JSONObject(responseBody).optJSONArray("files") ?: return JSONObject()
+                .body?.string() ?: return ""
+            val files = JSONObject(responseBody).optJSONArray("files") ?: return ""
 
             if (files.length() > 0) {
                 val fileId = files.getJSONObject(0).getString("id")
-                val contentBody = client.newCall(
+                client.newCall(
                     GET("$apiUrl/$fileId?alt=media&key=$apiKey", headers),
-                ).execute().body?.string() ?: return JSONObject()
-                JSONObject(contentBody)
+                ).execute().body?.string() ?: ""
             } else {
-                JSONObject()
+                ""
             }
-        } catch (e: Exception) { JSONObject() }
+        } catch (e: Exception) { "" }
+    }
+
+    private fun extractXmlTag(xml: String, tag: String): String? {
+        val regex = Regex("<$tag[^>]*>(.*?)</$tag>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        return regex.find(xml)?.groupValues?.get(1)?.trim()
+    }
+
+    private fun parseComicInfo(xml: String, manga: SManga) {
+        val summary = extractXmlTag(xml, "Summary")
+            ?.replace("&amp;", "&")
+            ?.replace("&lt;", "<")
+            ?.replace("&gt;", ">")
+        val writer = extractXmlTag(xml, "Writer")
+        val publisher = extractXmlTag(xml, "Publisher")
+        val statusStr = extractXmlTag(xml, "Status")
+        val genre = extractXmlTag(xml, "Genre")
+
+        manga.description = summary ?: "Tidak ada deskripsi."
+        manga.author = listOfNotNull(writer, publisher.takeIf { !it.isNullOrBlank() })
+            .joinToString(" | ")
+            .takeIf { it.isNotBlank() } ?: "Unknown"
+        manga.genre = genre
+        manga.status = when (statusStr?.lowercase()) {
+            "ongoing" -> SManga.ONGOING
+            "completed", "end" -> SManga.COMPLETED
+            "cancelled", "abandoned" -> SManga.CANCELLED
+            "hiatus" -> SManga.ON_HIATUS
+            else -> SManga.UNKNOWN
+        }
     }
 
     private fun getCoverUrlForManga(mangaFolderId: String): String {
         return try {
             val query = "'$mangaFolderId' in parents and trashed = false and " +
-                "(name = 'cover.jpg' or name = 'cover.jpeg' or name = 'cover.png' or name = 'cover.webp')"
+                "(name = 'cover.jpg' or name = 'cover.jpeg' or name = 'cover.png' or name = 'cover.webp' or name = 'cover.avif')"
             val url = buildApiUrl(query, pageSize = 1, fields = "files(id)")
             val responseBody = client.newCall(GET(url, headers)).execute()
                 .body?.string() ?: return fetchFirstImageAsCover(mangaFolderId)
             val files = JSONObject(responseBody).optJSONArray("files")
 
             if (files != null && files.length() > 0) {
-                // DIPERBARUI: Menggunakan endpoint API
-                "$apiUrl/${files.getJSONObject(0).getString("id")}?alt=media&key=$apiKey"
+                "$baseUrl/uc?export=view&id=${files.getJSONObject(0).getString("id")}"
             } else {
                 fetchFirstImageAsCover(mangaFolderId)
             }
@@ -189,14 +216,14 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     private fun fetchFirstImageAsCover(mangaFolderId: String): String {
         return try {
-            val query = "'$mangaFolderId' in parents and mimeType contains 'image/' and trashed = false"
+            // Ditambahkan fileExtension = 'avif' untuk antisipasi jika mimetype avif tidak diset sebagai image oleh Google
+            val query = "'$mangaFolderId' in parents and (mimeType contains 'image/' or fileExtension = 'avif' or name contains '.avif') and trashed = false"
             val url = buildApiUrl(query, pageSize = 1, fields = "files(id)")
             val responseBody = client.newCall(GET(url, headers)).execute()
                 .body?.string() ?: return ""
             val files = JSONObject(responseBody).optJSONArray("files")
             if (files != null && files.length() > 0) {
-                // DIPERBARUI: Menggunakan endpoint API
-                "$apiUrl/${files.getJSONObject(0).getString("id")}?alt=media&key=$apiKey"
+                "$baseUrl/uc?export=view&id=${files.getJSONObject(0).getString("id")}"
             } else { "" }
         } catch (e: Exception) { "" }
     }
@@ -278,24 +305,23 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val body = response.body?.string() ?: return SManga.create()
         val json = JSONObject(body)
         val mangaId = json.getString("id")
-        val metadata = getMetadata(mangaId)
 
-        val authorName = metadata.optString("author", "Unknown")
-        val publisherName = metadata.optString("publisher", "")
-
-        return SManga.create().apply {
+        val manga = SManga.create().apply {
             title = json.getString("name")
-            description = metadata.optString("description", "Manga di-streaming dari Google Drive.")
-            author = if (publisherName.isNotEmpty()) "$authorName | $publisherName" else authorName
-            status = when (metadata.optInt("status", 0)) {
-                1 -> SManga.ONGOING
-                2 -> SManga.COMPLETED
-                6 -> SManga.CANCELLED
-                else -> SManga.UNKNOWN
-            }
             thumbnail_url = getCoverUrlForManga(mangaId)
             initialized = true
         }
+
+        val comicInfoXml = getComicInfoXml(mangaId)
+        if (comicInfoXml.isNotBlank()) {
+            parseComicInfo(comicInfoXml, manga)
+        } else {
+            manga.description = "Tidak ada deskripsi."
+            manga.author = "Unknown"
+            manga.status = SManga.UNKNOWN
+        }
+
+        return manga
     }
 
     // ─── State sementara untuk pagination chapter & page ─────────────────────
@@ -346,8 +372,9 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     // ─── Page List ───────────────────────────────────────────────────────────
 
     override fun pageListRequest(chapter: SChapter): Request {
-        currentPageQuery = "q=${URLEncoder.encode("'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false", "UTF-8")}&orderBy=name"
-        val query = "'${chapter.url}' in parents and mimeType contains 'image/' and trashed = false"
+        // Ditambahkan fileExtension = 'avif' atau pencarian nama file untuk menjaring AVIF yang tidak masuk ke mimeType image
+        val query = "'${chapter.url}' in parents and (mimeType contains 'image/' or fileExtension = 'avif' or name contains '.avif') and trashed = false"
+        currentPageQuery = "q=${URLEncoder.encode(query, "UTF-8")}&orderBy=name"
         return GET(buildApiUrl(query, pageSize = PAGE_SIZE_LARGE, fields = "nextPageToken,files(id,name)"), headers)
     }
 
@@ -379,8 +406,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         }
 
         return allFiles.mapIndexed { i, file ->
-            // DIPERBARUI: Menggunakan endpoint API
-            Page(i, "", "$apiUrl/${file.getString("id")}?alt=media&key=$apiKey")
+            Page(i, "", "$baseUrl/uc?export=view&id=${file.getString("id")}")
         }
     }
 
