@@ -129,31 +129,71 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         return sb.toString()
     }
 
+    // Melakukan request bersih untuk menghindari pemblokiran Google API akibat modifikasi headers
+    private fun createCleanGet(url: String): Request {
+        return Request.Builder()
+            .url(url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .build()
+    }
+
     // ─── Metadata & Cover ────────────────────────────────────────────────────
 
     private fun getComicInfoXml(mangaFolderId: String): String {
         return try {
-            // Menggunakan 'contains' agar pencarian nama file menjadi Case-Insensitive di API GDrive
-            val query = "'$mangaFolderId' in parents and (name contains 'comicinfo' or name contains 'ComicInfo') and trashed = false"
-            val url = buildApiUrl(query, pageSize = 10, fields = "files(id,name)")
-            val responseBody = client.newCall(GET(url, headers)).execute()
-                .body?.string() ?: return ""
+            // 1. Strategi Pertama: Cari langsung di folder utama manga
+            var xmlContent = findAndDownloadComicInfo(mangaFolderId)
+            if (xmlContent.isNotBlank()) return xmlContent
+
+            // 2. Strategi Kedua: Jika tidak ada, cari di dalam subfolder (misal folder chapter di dalam folder manga)
+            val subFolderQuery = "'$mangaFolderId' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            val subFolderUrl = buildApiUrl(subFolderQuery, pageSize = 5, fields = "files(id)")
+            val subFolderResponseBody = client.newCall(createCleanGet(subFolderUrl)).execute().body?.string() ?: ""
+            val subFolders = JSONObject(subFolderResponseBody).optJSONArray("files")
+
+            if (subFolders != null) {
+                for (i in 0 until subFolders.length()) {
+                    val subFolderId = subFolders.getJSONObject(i).getString("id")
+                    xmlContent = findAndDownloadComicInfo(subFolderId)
+                    if (xmlContent.isNotBlank()) return xmlContent
+                }
+            }
+            ""
+        } catch (e: Exception) { "" }
+    }
+
+    private fun findAndDownloadComicInfo(folderId: String): String {
+        try {
+            val query = "'$folderId' in parents and name contains 'comicinfo' and trashed = false"
+            val url = buildApiUrl(query, pageSize = 5, fields = "files(id,name)")
+            val responseBody = client.newCall(createCleanGet(url)).execute().body?.string() ?: return ""
             val files = JSONObject(responseBody).optJSONArray("files") ?: return ""
 
             for (i in 0 until files.length()) {
                 val file = files.getJSONObject(i)
                 val fileName = file.optString("name", "")
-                // Memastikan nama file sangat akurat tanpa mempedulikan huruf besar/kecil
                 if (fileName.equals("comicinfo.xml", ignoreCase = true)) {
                     val fileId = file.getString("id")
-                    // Menggunakan endpoint /uc?export=download karena terbukti aman dilewati tanpa kendala hak akses API stream murni
-                    val downloadUrl = "$baseUrl/uc?export=download&id=$fileId"
-                    val response = client.newCall(GET(downloadUrl, headers)).execute()
-                    return response.body?.string() ?: ""
+
+                    // Jalur Utama: API resmi dengan parameter alt=media (Paling aman untuk data teks terenkripsi API Key)
+                    val apiUrlDownload = "$apiUrl/$fileId?alt=media&key=$apiKey"
+                    val res1 = client.newCall(createCleanGet(apiUrlDownload)).execute()
+                    if (res1.isSuccessful) {
+                        val content = res1.body?.string() ?: ""
+                        if (content.contains("<ComicInfo", ignoreCase = true)) return content
+                    }
+
+                    // Jalur Cadangan: Web download view link jika jalur API terhambat limit/permission
+                    val webDownloadUrl = "$baseUrl/uc?export=download&id=$fileId"
+                    val res2 = client.newCall(createCleanGet(webDownloadUrl)).execute()
+                    if (res2.isSuccessful) {
+                        val content = res2.body?.string() ?: ""
+                        if (content.contains("<ComicInfo", ignoreCase = true)) return content
+                    }
                 }
             }
-            ""
-        } catch (e: Exception) { "" }
+        } catch (e: Exception) { }
+        return ""
     }
 
     private fun extractXmlTag(xml: String, tag: String): String? {
@@ -172,7 +212,7 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
             ?.replace("&gt;", ">")
             ?.replace("&quot;", "\"")
             ?.replace("&apos;", "'")
-        
+
         val writer = extractXmlTag(xml, "Writer")
         val penciller = extractXmlTag(xml, "Penciller")
         val publisher = extractXmlTag(xml, "Publisher")
@@ -181,25 +221,22 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
         val genre = extractXmlTag(xml, "Genre")
         val categories = extractXmlTag(xml, "Categories")
 
-        // Jika tag <Series> ada, gunakan ini sebagai judul utama komik menggantikan nama folder Drive
         if (!series.isNullOrBlank()) {
             manga.title = series
         }
-        
+
         manga.description = summary ?: "Tidak ada deskripsi."
 
-        // Ambil pembuat komik yang tersedia (Writer / Penciller / Publisher)
         val authorsList = listOfNotNull(writer, penciller, publisher).distinct()
         manga.author = authorsList.joinToString(" | ").takeIf { it.isNotBlank() } ?: "Unknown"
         manga.artist = penciller ?: writer ?: "Unknown"
 
-        // Menggabungkan tag <Genre> bawaan dan <ty:Categories> khas Tachiyomi/Aniyomi
         val allGenres = listOfNotNull(genre, categories)
             .flatMap { it.split(",") }
             .map { it.trim() }
             .filter { it.isNotBlank() }
             .distinct()
-            
+
         if (allGenres.isNotEmpty()) {
             manga.genre = allGenres.joinToString(", ")
         }
