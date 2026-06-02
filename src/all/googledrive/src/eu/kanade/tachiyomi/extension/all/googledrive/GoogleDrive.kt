@@ -133,27 +133,30 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
 
     private fun getComicInfoXml(mangaFolderId: String): String {
         return try {
-            val query = "'$mangaFolderId' in parents and name = 'ComicInfo.xml' and trashed = false"
-            val url = buildApiUrl(query, pageSize = 1, fields = "files(id)")
+            // Menggunakan 'contains' agar pencarian nama file menjadi Case-Insensitive di API GDrive
+            val query = "'$mangaFolderId' in parents and (name contains 'comicinfo' or name contains 'ComicInfo') and trashed = false"
+            val url = buildApiUrl(query, pageSize = 10, fields = "files(id,name)")
             val responseBody = client.newCall(GET(url, headers)).execute()
                 .body?.string() ?: return ""
             val files = JSONObject(responseBody).optJSONArray("files") ?: return ""
 
-            if (files.length() > 0) {
-                val fileId = files.getJSONObject(0).getString("id")
-                // Mengambil string data (isi XML) secara eksplisit dari API Google Drive
-                val response = client.newCall(
-                    GET("$apiUrl/$fileId?alt=media&key=$apiKey", headers),
-                ).execute()
-                response.body?.string() ?: ""
-            } else {
-                ""
+            for (i in 0 until files.length()) {
+                val file = files.getJSONObject(i)
+                val fileName = file.optString("name", "")
+                // Memastikan nama file sangat akurat tanpa mempedulikan huruf besar/kecil
+                if (fileName.equals("comicinfo.xml", ignoreCase = true)) {
+                    val fileId = file.getString("id")
+                    // Menggunakan endpoint /uc?export=download karena terbukti aman dilewati tanpa kendala hak akses API stream murni
+                    val downloadUrl = "$baseUrl/uc?export=download&id=$fileId"
+                    val response = client.newCall(GET(downloadUrl, headers)).execute()
+                    return response.body?.string() ?: ""
+                }
             }
+            ""
         } catch (e: Exception) { "" }
     }
 
     private fun extractXmlTag(xml: String, tag: String): String? {
-        // Regex diperbarui untuk mentoleransi namespace "ty:" dan atribut XML (seperti xmlns:ty=...)
         val regex = Regex(
             "<(?:\\w+:)?$tag(?:\\s+[^>]*)?>(.*?)</(?:\\w+:)?$tag>",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
@@ -162,30 +165,35 @@ class GoogleDrive : HttpSource(), ConfigurableSource {
     }
 
     private fun parseComicInfo(xml: String, manga: SManga) {
+        val series = extractXmlTag(xml, "Series")
         val summary = extractXmlTag(xml, "Summary")
             ?.replace("&amp;", "&")
             ?.replace("&lt;", "<")
             ?.replace("&gt;", ">")
+            ?.replace("&quot;", "\"")
+            ?.replace("&apos;", "'")
         
         val writer = extractXmlTag(xml, "Writer")
         val penciller = extractXmlTag(xml, "Penciller")
         val publisher = extractXmlTag(xml, "Publisher")
 
-        // Memeriksa status baik dari format Tachiyomi custom ataupun standard Status
         val statusStr = extractXmlTag(xml, "PublishingStatusTachiyomi") ?: extractXmlTag(xml, "Status")
         val genre = extractXmlTag(xml, "Genre")
         val categories = extractXmlTag(xml, "Categories")
 
+        // Jika tag <Series> ada, gunakan ini sebagai judul utama komik menggantikan nama folder Drive
+        if (!series.isNullOrBlank()) {
+            manga.title = series
+        }
+        
         manga.description = summary ?: "Tidak ada deskripsi."
 
-        // Gabungkan list author/artist/publisher dan hilangkan tag yang kosong atau duplikat
+        // Ambil pembuat komik yang tersedia (Writer / Penciller / Publisher)
         val authorsList = listOfNotNull(writer, penciller, publisher).distinct()
         manga.author = authorsList.joinToString(" | ").takeIf { it.isNotBlank() } ?: "Unknown"
-        
-        // Memasukkan artist ke dalam variabel sendiri jika didukung oleh Aniyomi
         manga.artist = penciller ?: writer ?: "Unknown"
 
-        // Gabungkan tag <Genre> biasa dengan <ty:Categories> agar menjadi array genre Tachiyomi
+        // Menggabungkan tag <Genre> bawaan dan <ty:Categories> khas Tachiyomi/Aniyomi
         val allGenres = listOfNotNull(genre, categories)
             .flatMap { it.split(",") }
             .map { it.trim() }
