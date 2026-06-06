@@ -43,7 +43,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         screen.addPreference(baseUrlPref)
     }
 
-    // ─── Browse / Popular (Daftar Folder Manga) ──────────────────────────────
+    // ─── Browse / Popular ────────────────────────────────────────────────────
 
     override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/", headers)
 
@@ -58,7 +58,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     var relUrl = absUrl.removePrefix(baseUrl)
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
-                    thumbnail_url = null
+                    // Thumbnail dikosongkan di sini agar Tachiyomi menariknya dari mangaDetailsParse
                 }
             }
         return MangasPage(mangas, false)
@@ -89,17 +89,36 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         return MangasPage(mangas, false)
     }
 
-    // ─── Manga Details ───────────────────────────────────────────────────────
+    // ─── Manga Details (Fitur Pencari Cover Gambar Otomatis) ─────────────────
 
     override fun mangaDetailsParse(document: Document): SManga {
+        // Mencari semua link gambar di dalam folder utama manga
+        val links = document.select("a[href]")
+        val imageLinks = links.filter { 
+            val href = it.attr("href").lowercase()
+            !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".jpeg") || 
+                                     href.endsWith(".png") || href.endsWith(".webp") || 
+                                     href.endsWith(".avif") || href.endsWith(".gif") || 
+                                     href.endsWith(".heic") || href.endsWith(".jxl"))
+        }
+
+        // Memprioritaskan file dengan nama cover/poster/thumb
+        val coverElement = imageLinks.find { 
+            val href = it.attr("href").lowercase()
+            href.contains("cover") || href.contains("poster") || href.contains("thumb")
+        } ?: imageLinks.firstOrNull() // Jika tidak ketemu, ambil sembarang gambar pertama
+
         return SManga.create().apply {
             description = "Folder manga lokal dari Server LocalStream (WebDAV/HTTP)."
             status = SManga.UNKNOWN
+            if (coverElement != null) {
+                thumbnail_url = coverElement.absUrl("href")
+            }
             initialized = true
         }
     }
 
-    // ─── Chapter List (Daftar Folder Chapter) ────────────────────────────────
+    // ─── Chapter List ────────────────────────────────────────────────────────
 
     override fun chapterListRequest(manga: SManga): Request = GET(baseUrl + manga.url, headers)
 
@@ -107,9 +126,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val document = response.asJsoup()
         return document.select("a[href]")
             .filter { element ->
-                val href = element.attr("href")
-                // Mengambil folder chapter atau file arsip (cbz/zip) jika Rclone disetting melayaninya
-                !href.contains("..") && (href.endsWith("/") || href.lowercase().endsWith(".cbz") || href.lowercase().endsWith(".zip"))
+                val href = element.attr("href").lowercase()
+                !href.contains("..") && (href.endsWith("/") || href.endsWith(".cbz") || href.endsWith(".zip"))
             }
             .mapIndexed { index, element ->
                 SChapter.create().apply {
@@ -120,10 +138,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     url = relUrl
                     chapter_number = (index + 1).toFloat()
                 }
-            }.reversed() // Dibalik agar chapter terbaru (angka terbesar) ada di atas
+            }.reversed()
     }
 
-    // ─── Page List (Daftar Gambar dalam Chapter) ─────────────────────────────
+    // ─── Page List (Membaca Semua Format Gambar) ─────────────────────────────
 
     override fun pageListRequest(chapter: SChapter): Request = GET(baseUrl + chapter.url, headers)
 
@@ -132,16 +150,20 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         return document.select("a[href]")
             .filter { element ->
                 val href = element.attr("href").lowercase()
-                !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".png") || href.endsWith(".jpeg") || href.endsWith(".webp"))
+                val isImage = href.endsWith(".jpg") || href.endsWith(".png") || 
+                              href.endsWith(".jpeg") || href.endsWith(".webp") || 
+                              href.endsWith(".avif") || href.endsWith(".gif") || 
+                              href.endsWith(".heic") || href.endsWith(".jxl") || 
+                              href.endsWith(".bmp")
+                !href.contains("..") && isImage
             }
             .mapIndexed { index, element ->
                 val absUrl = element.absUrl("href")
-                // Langsung berikan URL gambar, tidak perlu imageUrlParse
                 Page(index, "", absUrl)
             }
     }
 
-    // ─── Abstract Methods (Wajib dioverride tapi tidak dipakai) ──────────────
+    // ─── Abstract Methods ────────────────────────────────────────────────────
     override fun popularMangaSelector(): String = ""
     override fun popularMangaFromElement(element: Element): SManga = SManga.create()
     override fun popularMangaNextPageSelector(): String? = null
