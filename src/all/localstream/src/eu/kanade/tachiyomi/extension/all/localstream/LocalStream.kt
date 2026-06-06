@@ -151,6 +151,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     override fun chapterFromElement(element: Element): SChapter = SChapter.create()
     override fun chapterListSelector(): String = ""
     override fun imageUrlParse(document: Document): String = ""
+    override fun pageListParse(document: Document): List<Page> = throw UnsupportedOperationException("Not used")
     override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException("Not used")
     override fun latestUpdatesSelector(): String = ""
     override fun latestUpdatesFromElement(element: Element): SManga = SManga.create()
@@ -160,4 +161,3 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         private const val BASE_URL_PREF = "BASE_URL_PREF_LOCALSTREAM_MANGA"
     }
 }
-
