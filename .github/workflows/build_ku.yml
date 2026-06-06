@@ -2,9 +2,8 @@ name: Build Ekstensiku
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    paths:
+      - 'src/all/googledrive/**' # Tambahkan baris ini!
 
 permissions:
   contents: read
