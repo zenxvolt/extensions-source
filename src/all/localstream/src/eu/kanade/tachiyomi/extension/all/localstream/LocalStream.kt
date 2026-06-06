@@ -43,6 +43,33 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         screen.addPreference(baseUrlPref)
     }
 
+    // Fungsi Pembantu: Mengintip cover langsung ke dalam folder manga
+    private fun getCoverUrl(folderUrl: String): String? {
+        return try {
+            // Melakukan HTTP Request secara instan ke dalam folder manga
+            val response = client.newCall(GET(folderUrl, headers)).execute()
+            val document = response.asJsoup()
+            val links = document.select("a[href]")
+            
+            val imageLinks = links.filter { 
+                val href = it.attr("href").lowercase()
+                !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".jpeg") || 
+                                         href.endsWith(".png") || href.endsWith(".webp") || 
+                                         href.endsWith(".avif") || href.endsWith(".gif") || 
+                                         href.endsWith(".heic") || href.endsWith(".jxl"))
+            }
+
+            val coverElement = imageLinks.find { 
+                val href = it.attr("href").lowercase()
+                href.contains("cover") || href.contains("poster") || href.contains("thumb")
+            } ?: imageLinks.firstOrNull()
+
+            coverElement?.absUrl("href")
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     // ─── Browse / Popular ────────────────────────────────────────────────────
 
     override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/", headers)
@@ -58,7 +85,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     var relUrl = absUrl.removePrefix(baseUrl)
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
-                    // Thumbnail dikosongkan di sini agar Tachiyomi menariknya dari mangaDetailsParse
+                    // Menarik cover langsung saat list dimuat!
+                    thumbnail_url = getCoverUrl(absUrl)
                 }
             }
         return MangasPage(mangas, false)
@@ -84,15 +112,16 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     var relUrl = absUrl.removePrefix(baseUrl)
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
+                    // Menarik cover langsung saat list dimuat!
+                    thumbnail_url = getCoverUrl(absUrl)
                 }
             }
         return MangasPage(mangas, false)
     }
 
-    // ─── Manga Details (Fitur Pencari Cover Gambar Otomatis) ─────────────────
+    // ─── Manga Details ───────────────────────────────────────────────────────
 
     override fun mangaDetailsParse(document: Document): SManga {
-        // Mencari semua link gambar di dalam folder utama manga
         val links = document.select("a[href]")
         val imageLinks = links.filter { 
             val href = it.attr("href").lowercase()
@@ -102,11 +131,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                                      href.endsWith(".heic") || href.endsWith(".jxl"))
         }
 
-        // Memprioritaskan file dengan nama cover/poster/thumb
         val coverElement = imageLinks.find { 
             val href = it.attr("href").lowercase()
             href.contains("cover") || href.contains("poster") || href.contains("thumb")
-        } ?: imageLinks.firstOrNull() // Jika tidak ketemu, ambil sembarang gambar pertama
+        } ?: imageLinks.firstOrNull()
 
         return SManga.create().apply {
             description = "Folder manga lokal dari Server LocalStream (WebDAV/HTTP)."
@@ -141,7 +169,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             }.reversed()
     }
 
-    // ─── Page List (Membaca Semua Format Gambar) ─────────────────────────────
+    // ─── Page List ───────────────────────────────────────────────────────────
 
     override fun pageListRequest(chapter: SChapter): Request = GET(baseUrl + chapter.url, headers)
 
