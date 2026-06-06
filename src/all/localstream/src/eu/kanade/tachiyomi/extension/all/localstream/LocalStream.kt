@@ -14,6 +14,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -94,10 +95,9 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    // PERBAIKAN TOTAL: Menggunakan OkHttp HttpUrl Builder 
-                    // Ini akan menerjemahkan spasi, kurung siku, dan simbol lain menjadi format URL yang sah
                     val cleanAbsUrl = absUrl.removeSuffix("/")
-                    val parsedUrl = HttpUrl.parse(cleanAbsUrl)
+                    // Menggunakan extension function toHttpUrlOrNull()
+                    val parsedUrl = cleanAbsUrl.toHttpUrlOrNull()
                     
                     thumbnail_url = parsedUrl?.newBuilder()
                         ?.addPathSegment(defaultCoverName.trim())
@@ -131,7 +131,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     url = relUrl
                     
                     val cleanAbsUrl = absUrl.removeSuffix("/")
-                    val parsedUrl = HttpUrl.parse(cleanAbsUrl)
+                    val parsedUrl = cleanAbsUrl.toHttpUrlOrNull()
                     
                     thumbnail_url = parsedUrl?.newBuilder()
                         ?.addPathSegment(defaultCoverName.trim())
@@ -163,9 +163,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             description = "Folder manga lokal dari Server LocalStream (WebDAV/HTTP)."
             status = SManga.UNKNOWN
             if (coverElement != null) {
-                // Gunakan HttpUrl di sini juga untuk memastikan validitas
                 val absUrl = coverElement.absUrl("href")
-                thumbnail_url = HttpUrl.parse(absUrl)?.toString() ?: absUrl.replace(" ", "%20")
+                thumbnail_url = absUrl.toHttpUrlOrNull()?.toString() ?: absUrl.replace(" ", "%20")
             }
             initialized = true
         }
@@ -225,7 +224,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
         return sortedPages.mapIndexed { index, element ->
             val absUrl = element.absUrl("href")
-            val validUrl = HttpUrl.parse(absUrl)?.toString() ?: absUrl.replace(" ", "%20")
+            val validUrl = absUrl.toHttpUrlOrNull()?.toString() ?: absUrl.replace(" ", "%20")
             Page(index, "", validUrl)
         }
     }
