@@ -1,0 +1,8 @@
+ext {
+    extName = 'LocalStream'
+    extClass = '.LocalStream'
+    extVersionCode = 1
+}
+
+apply plugin: "kei.plugins.extension.legacy"
+
