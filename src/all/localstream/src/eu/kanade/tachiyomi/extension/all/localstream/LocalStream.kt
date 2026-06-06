@@ -88,14 +88,14 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                 SManga.create().apply {
                     title = element.text().removeSuffix("/")
                     val absUrl = element.absUrl("href")
+                    
                     var relUrl = absUrl.removePrefix(baseUrl)
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
-                    url = relUrl
+                    url = relUrl // relUrl pasti berakhiran "/" karena filter di atas
                     
-                    // EFISIENSI: Menebak URL cover langsung tanpa HTTP Request!
-                    // Tachiyomi akan memuatnya di background menggunakan Coil/Glide.
-                    val folderUrl = absUrl.removeSuffix("/")
-                    thumbnail_url = "$folderUrl/$defaultCoverName"
+                    // PERBAIKAN: Mengatasi spasi pada URL agar tidak ditolak oleh Image Loader
+                    val rawThumbnailUrl = baseUrl + url + defaultCoverName
+                    thumbnail_url = rawThumbnailUrl.replace(" ", "%20")
                 }
             }
         return MangasPage(mangas, false)
@@ -118,13 +118,14 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                 SManga.create().apply {
                     title = element.text().removeSuffix("/")
                     val absUrl = element.absUrl("href")
+                    
                     var relUrl = absUrl.removePrefix(baseUrl)
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    // EFISIENSI: Sama dengan popularMangaParse
-                    val folderUrl = absUrl.removeSuffix("/")
-                    thumbnail_url = "$folderUrl/$defaultCoverName"
+                    // PERBAIKAN: Sama seperti di popularMangaParse
+                    val rawThumbnailUrl = baseUrl + url + defaultCoverName
+                    thumbnail_url = rawThumbnailUrl.replace(" ", "%20")
                 }
             }
         return MangasPage(mangas, false)
@@ -142,7 +143,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                                      href.endsWith(".heic") || href.endsWith(".jxl"))
         }
 
-        // Cari cover secara aktual jika user membuka detail (fallback jika tebakan di Browse salah)
         val coverElement = imageLinks.find { 
             val href = it.attr("href").lowercase()
             href.contains("cover") || href.contains("poster") || href.contains("thumb")
@@ -152,7 +152,9 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             description = "Folder manga lokal dari Server LocalStream (WebDAV/HTTP)."
             status = SManga.UNKNOWN
             if (coverElement != null) {
-                thumbnail_url = coverElement.absUrl("href")
+                // Di sini tidak perlu diubah spasi manual karena jsoup absUrl pada detail page
+                // biasanya sudah mengkompensasi atau Coil menanganinya dari Object Header
+                thumbnail_url = coverElement.absUrl("href").replace(" ", "%20")
             }
             initialized = true
         }
@@ -171,7 +173,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                 !href.contains("..") && (href.endsWith("/") || href.endsWith(".cbz") || href.endsWith(".zip"))
             }
 
-        // Menggunakan Natural Sorting agar Chapter 10 tidak muncul sebelum Chapter 2
         val comparator = naturalSortComparator()
         val sortedElements = chapterElements.sortedWith { a, b -> 
             comparator.compare(a.text(), b.text()) 
@@ -186,7 +187,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     url = relUrl
                     chapter_number = (index + 1).toFloat()
                 }
-            }.reversed() // Reversed agar chapter terbaru (angka besar) di atas
+            }.reversed() 
     }
 
     // ─── Page List ───────────────────────────────────────────────────────────
@@ -206,7 +207,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                 !href.contains("..") && isImage
             }
 
-        // Natural Sorting juga diterapkan pada halaman (Page 10 tidak menumpuk di atas Page 2)
         val comparator = naturalSortComparator()
         val sortedPages = pageElements.sortedWith { a, b -> 
             comparator.compare(a.text(), b.text()) 
@@ -214,7 +214,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
         return sortedPages.mapIndexed { index, element ->
             val absUrl = element.absUrl("href")
-            Page(index, "", absUrl)
+            Page(index, "", absUrl.replace(" ", "%20")) // Amankan juga URL halamannya
         }
     }
 
