@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.extension.all.localstream
 
 import android.app.Application
 import android.content.SharedPreferences
+import android.net.Uri
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
@@ -14,13 +15,13 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.math.BigInteger
 
 class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
@@ -33,42 +34,17 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     }
 
     override val baseUrl: String
-        get() = preferences.getString(BASE_URL_PREF, "http://127.0.0.1:8080")?.removeSuffix("/") ?: "http://127.0.0.1:8080"
+        get() = preferences.getString(BASE_URL_PREF, "http://127.0.0.1:8080")?.removeSuffix("/")
+            ?: "http://127.0.0.1:8080"
 
     private val defaultCoverName: String
         get() = preferences.getString(COVER_NAME_PREF, "cover.jpg") ?: "cover.jpg"
-
-    /**
-     * INTERCEPTOR: Menangani pencarian cover secara pintar di background thread (Lazy Loading).
-     * Ini membuat halaman browse tidak akan freeze/loading terus-menerus.
-     */
-    override val client: OkHttpClient = network.client.newBuilder()
-        .addInterceptor { chain ->
-            val request = chain.request()
-            val url = request.url
-            
-            // Cek apakah ini request cover kiriman dari halaman browse
-            if (url.queryParameter("localstream_cover") == "true") {
-                val cleanUrl = url.newBuilder().removeAllQueryParameters("localstream_cover").build()
-                
-                // Intip isi folder secara asinkronus (hanya saat Coil/Aniyomi meminta gambar ini)
-                val realCoverUrl = peekCoverFromFolder(cleanUrl.toString())
-                
-                val finalUrl = realCoverUrl?.toHttpUrlOrNull() 
-                    ?: cleanUrl.newBuilder().addPathSegment(defaultCoverName.trim()).build()
-                
-                chain.proceed(request.newBuilder().url(finalUrl).build())
-            } else {
-                chain.proceed(request)
-            }
-        }
-        .build()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val baseUrlPref = EditTextPreference(screen.context).apply {
             key = BASE_URL_PREF
             title = "Server URL (Round Sync / Termux)"
-            summary = "Masukkan URL lokal dari Rclone Serve."
+            summary = "Masukkan URL lokal dari server file kamu."
             setDefaultValue("http://127.0.0.1:8080")
         }
         screen.addPreference(baseUrlPref)
@@ -76,22 +52,23 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val coverNamePref = EditTextPreference(screen.context).apply {
             key = COVER_NAME_PREF
             title = "Nama File Cover Default"
-            summary = "Harus SAMA PERSIS dengan nama file di dalam folder (case-sensitive)."
+            summary = "Harus sama persis dengan nama file cover di folder."
             setDefaultValue("cover.jpg")
         }
         screen.addPreference(coverNamePref)
     }
 
-    // ─── Helpers: Natural Sort ───────────────────────────────────────────────
+    // ─── Helpers ────────────────────────────────────────────────────────────
 
     private fun naturalSortComparator(): Comparator<String> = Comparator { a, b ->
         val tokensA = tokenize(a)
         val tokensB = tokenize(b)
         val len = minOf(tokensA.size, tokensB.size)
+
         for (i in 0 until len) {
             val ta = tokensA[i]
             val tb = tokensB[i]
-            val cmp = if (ta.first().isDigit() && tb.first().isDigit()) {
+            val cmp = if (ta.firstOrNull()?.isDigit() == true && tb.firstOrNull()?.isDigit() == true) {
                 ta.toBigInteger().compareTo(tb.toBigInteger())
             } else {
                 ta.lowercase().compareTo(tb.lowercase())
@@ -104,102 +81,107 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     private fun tokenize(s: String): List<String> =
         Regex("(\\d+|\\D+)").findAll(s).map { it.value }.toList()
 
-    /**
-     * Fungsi pembantu untuk mengintip isi folder.
-     * Menggunakan 'network.client' langsung agar bypass dari interceptor utama (mencegah loop).
-     */
-    private fun peekCoverFromFolder(folderUrl: String): String? {
-        return try {
-            val safeUrl = if (folderUrl.contains(" ")) folderUrl.replace(" ", "%20") else folderUrl
-            val peekRequest = Request.Builder().url(safeUrl).headers(headers).build()
-            val response = network.client.newCall(peekRequest).execute()
-            if (!response.isSuccessful) return null
-            
-            val document = response.asJsoup()
-            val links = document.select("a[href]")
-            val imageLinks = links.filter { 
-                val href = it.attr("href").lowercase()
-                !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".jpeg") || 
-                                         href.endsWith(".png") || href.endsWith(".webp") || 
-                                         href.endsWith(".avif") || href.endsWith(".gif") || 
-                                         href.endsWith(".heic") || href.endsWith(".jxl") ||
-                                         href.endsWith(".bmp"))
+    private fun encodePathSegments(path: String): String {
+        val trimmed = path.trim()
+        if (trimmed.isEmpty()) return ""
+
+        val leadingSlash = trimmed.startsWith("/")
+        val trailingSlash = trimmed.endsWith("/")
+
+        val encoded = trimmed
+            .trim('/')
+            .split('/')
+            .filter { it.isNotEmpty() }
+            .joinToString("/") { segment ->
+                val decoded = runCatching { Uri.decode(segment) }.getOrDefault(segment)
+                Uri.encode(decoded)
             }
 
-            val coverElement = imageLinks.find { 
-                val href = it.attr("href").lowercase()
-                href.contains("cover") || href.contains("poster") || href.contains("thumb")
-            } ?: imageLinks.firstOrNull()
-
-            coverElement?.absUrl("href")
-        } catch (e: Exception) {
-            null
+        return buildString {
+            if (leadingSlash) append("/")
+            append(encoded)
+            if (trailingSlash && encoded.isNotEmpty()) append("/")
         }
     }
 
-    // ─── Browse / Popular ────────────────────────────────────────────────────
+    private fun normalizeRelativeUrl(href: String): String {
+        val raw = href.trim()
+        if (raw.isEmpty()) return "/"
+
+        return if (raw.startsWith("http://") || raw.startsWith("https://")) {
+            val parsed = raw.toHttpUrlOrNull()
+            if (parsed != null) {
+                parsed.encodedPath.ifBlank { "/" }
+            } else {
+                raw
+            }
+        } else {
+            val encoded = encodePathSegments(raw)
+            if (encoded.startsWith("/")) encoded else "/$encoded"
+        }
+    }
+
+    private fun buildThumbnailUrl(relativeFolderUrl: String): String {
+        val folder = if (relativeFolderUrl.endsWith("/")) relativeFolderUrl else "$relativeFolderUrl/"
+        val cover = Uri.encode(defaultCoverName.trim())
+        return "$baseUrl$folder$cover"
+    }
+
+    private fun sanitizeAbsoluteUrl(url: String): String {
+        val parsed = url.toHttpUrlOrNull()
+        if (parsed != null) return parsed.toString()
+
+        return url
+            .replace(" ", "%20")
+            .replace("'", "%27")
+            .replace("\"", "%22")
+    }
+
+    // ─── Browse / Popular ───────────────────────────────────────────────────
 
     override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        val baseHttpUrl = baseUrl.toHttpUrlOrNull()
-        
+
         val mangas = document.select("a[href]")
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
             .map { element ->
+                val folderUrl = normalizeRelativeUrl(element.attr("href"))
+
                 SManga.create().apply {
                     title = element.text().removeSuffix("/")
-                    val absUrl = element.absUrl("href")
-                    
-                    var relUrl = absUrl.removePrefix(baseUrl)
-                    if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
-                    url = relUrl
-                    
-                    // Tandai URL thumbnail dengan query khusus agar ditangkap oleh Interceptor secara lazy
-                    thumbnail_url = baseHttpUrl?.newBuilder()?.apply {
-                        relUrl.split("/").filter { it.isNotEmpty() }.forEach { segment ->
-                            addPathSegment(segment)
-                        }
-                        addQueryParameter("localstream_cover", "true")
-                    }?.build()?.toString()
+                    url = folderUrl
+                    thumbnail_url = buildThumbnailUrl(folderUrl)
                 }
             }
+
         return MangasPage(mangas, false)
     }
 
     // ─── Search ──────────────────────────────────────────────────────────────
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        return GET("$baseUrl/#query=${query.lowercase()}", headers)
+        return GET("$baseUrl/?search=${Uri.encode(query.lowercase())}", headers)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        val query = response.request.url.fragment?.lowercase() ?: ""
-        val baseHttpUrl = baseUrl.toHttpUrlOrNull()
-        
+        val query = response.request.url.queryParameter("search")?.lowercase().orEmpty()
+
         val mangas = document.select("a[href]")
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
             .filter { it.text().lowercase().contains(query) }
             .map { element ->
+                val folderUrl = normalizeRelativeUrl(element.attr("href"))
+
                 SManga.create().apply {
                     title = element.text().removeSuffix("/")
-                    val absUrl = element.absUrl("href")
-                    
-                    var relUrl = absUrl.removePrefix(baseUrl)
-                    if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
-                    url = relUrl
-                    
-                    // Tandai URL thumbnail dengan query khusus agar ditangkap oleh Interceptor secara lazy
-                    thumbnail_url = baseHttpUrl?.newBuilder()?.apply {
-                        relUrl.split("/").filter { it.isNotEmpty() }.forEach { segment ->
-                            addPathSegment(segment)
-                        }
-                        addQueryParameter("localstream_cover", "true")
-                    }?.build()?.toString()
+                    url = folderUrl
+                    thumbnail_url = buildThumbnailUrl(folderUrl)
                 }
             }
+
         return MangasPage(mangas, false)
     }
 
@@ -207,26 +189,30 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     override fun mangaDetailsParse(document: Document): SManga {
         val links = document.select("a[href]")
-        val imageLinks = links.filter { 
+        val imageLinks = links.filter {
             val href = it.attr("href").lowercase()
-            !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".jpeg") || 
-                                     href.endsWith(".png") || href.endsWith(".webp") || 
-                                     href.endsWith(".avif") || href.endsWith(".gif") || 
-                                     href.endsWith(".heic") || href.endsWith(".jxl"))
+            !href.contains("..") && (
+                href.endsWith(".jpg") || href.endsWith(".jpeg") ||
+                href.endsWith(".png") || href.endsWith(".webp") ||
+                href.endsWith(".avif") || href.endsWith(".gif") ||
+                href.endsWith(".heic") || href.endsWith(".jxl")
+            )
         }
 
-        val coverElement = imageLinks.find { 
+        val coverElement = imageLinks.find {
             val href = it.attr("href").lowercase()
             href.contains("cover") || href.contains("poster") || href.contains("thumb")
         } ?: imageLinks.firstOrNull()
 
         return SManga.create().apply {
-            description = "Folder manga lokal dari Server LocalStream (WebDAV/HTTP)."
+            description = "Folder manga lokal dari Server LocalStream."
             status = SManga.UNKNOWN
+
             if (coverElement != null) {
                 val absUrl = coverElement.absUrl("href")
-                thumbnail_url = absUrl.toHttpUrlOrNull()?.toString() ?: absUrl.replace(" ", "%20")
+                thumbnail_url = sanitizeAbsoluteUrl(absUrl)
             }
+
             initialized = true
         }
     }
@@ -237,7 +223,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
-        
+
         val chapterElements = document.select("a[href]")
             .filter { element ->
                 val href = element.attr("href").lowercase()
@@ -245,20 +231,19 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             }
 
         val comparator = naturalSortComparator()
-        val sortedElements = chapterElements.sortedWith { a, b -> 
-            comparator.compare(a.text(), b.text()) 
+        val sortedElements = chapterElements.sortedWith { a, b ->
+            comparator.compare(a.text(), b.text())
         }
 
         return sortedElements.mapIndexed { index, element ->
-                SChapter.create().apply {
-                    name = element.text().removeSuffix("/")
-                    val absUrl = element.absUrl("href")
-                    var relUrl = absUrl.removePrefix(baseUrl)
-                    if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
-                    url = relUrl
-                    chapter_number = (index + 1).toFloat()
-                }
-            }.reversed() 
+            val chapterUrl = normalizeRelativeUrl(element.attr("href"))
+
+            SChapter.create().apply {
+                name = element.text().removeSuffix("/")
+                url = chapterUrl
+                chapter_number = (index + 1).toFloat()
+            }
+        }.reversed()
     }
 
     // ─── Page List ───────────────────────────────────────────────────────────
@@ -267,41 +252,49 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
+
         val pageElements = document.select("a[href]")
             .filter { element ->
                 val href = element.attr("href").lowercase()
-                val isImage = href.endsWith(".jpg") || href.endsWith(".png") || 
-                              href.endsWith(".jpeg") || href.endsWith(".webp") || 
-                              href.endsWith(".avif") || href.endsWith(".gif") || 
-                              href.endsWith(".heic") || href.endsWith(".jxl") || 
-                              href.endsWith(".bmp")
+                val isImage = href.endsWith(".jpg") || href.endsWith(".png") ||
+                    href.endsWith(".jpeg") || href.endsWith(".webp") ||
+                    href.endsWith(".avif") || href.endsWith(".gif") ||
+                    href.endsWith(".heic") || href.endsWith(".jxl") ||
+                    href.endsWith(".bmp")
                 !href.contains("..") && isImage
             }
 
         val comparator = naturalSortComparator()
-        val sortedPages = pageElements.sortedWith { a, b -> 
-            comparator.compare(a.text(), b.text()) 
+        val sortedPages = pageElements.sortedWith { a, b ->
+            comparator.compare(a.text(), b.text())
         }
 
         return sortedPages.mapIndexed { index, element ->
             val absUrl = element.absUrl("href")
-            val validUrl = absUrl.toHttpUrlOrNull()?.toString() ?: absUrl.replace(" ", "%20")
+            val validUrl = sanitizeAbsoluteUrl(absUrl)
             Page(index, "", validUrl)
         }
     }
 
     // ─── Abstract Methods ────────────────────────────────────────────────────
+
     override fun popularMangaSelector(): String = ""
     override fun popularMangaFromElement(element: Element): SManga = SManga.create()
     override fun popularMangaNextPageSelector(): String? = null
+
     override fun searchMangaSelector(): String = ""
     override fun searchMangaFromElement(element: Element): SManga = SManga.create()
     override fun searchMangaNextPageSelector(): String? = null
+
     override fun chapterFromElement(element: Element): SChapter = SChapter.create()
     override fun chapterListSelector(): String = ""
+
     override fun imageUrlParse(document: Document): String = ""
-    override fun pageListParse(document: Document): List<Page> = throw UnsupportedOperationException("Not used")
-    override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException("Not used")
+    override fun pageListParse(document: Document): List<Page> =
+        throw UnsupportedOperationException("Not used")
+
+    override fun latestUpdatesRequest(page: Int): Request =
+        throw UnsupportedOperationException("Not used")
     override fun latestUpdatesSelector(): String = ""
     override fun latestUpdatesFromElement(element: Element): SManga = SManga.create()
     override fun latestUpdatesNextPageSelector(): String? = null
