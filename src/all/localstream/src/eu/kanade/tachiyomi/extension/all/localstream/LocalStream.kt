@@ -14,6 +14,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -36,6 +37,32 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     private val defaultCoverName: String
         get() = preferences.getString(COVER_NAME_PREF, "cover.jpg") ?: "cover.jpg"
+
+    /**
+     * INTERCEPTOR: Menangani pencarian cover secara pintar di background thread (Lazy Loading).
+     * Ini membuat halaman browse tidak akan freeze/loading terus-menerus.
+     */
+    override val client: OkHttpClient = network.client.newBuilder()
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val url = request.url
+            
+            // Cek apakah ini request cover kiriman dari halaman browse
+            if (url.queryParameter("localstream_cover") == "true") {
+                val cleanUrl = url.newBuilder().removeAllQueryParameters("localstream_cover").build()
+                
+                // Intip isi folder secara asinkronus (hanya saat Coil/Aniyomi meminta gambar ini)
+                val realCoverUrl = peekCoverFromFolder(cleanUrl.toString())
+                
+                val finalUrl = realCoverUrl?.toHttpUrlOrNull() 
+                    ?: cleanUrl.newBuilder().addPathSegment(defaultCoverName.trim()).build()
+                
+                chain.proceed(request.newBuilder().url(finalUrl).build())
+            } else {
+                chain.proceed(request)
+            }
+        }
+        .build()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val baseUrlPref = EditTextPreference(screen.context).apply {
@@ -78,13 +105,14 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         Regex("(\\d+|\\D+)").findAll(s).map { it.value }.toList()
 
     /**
-     * Fitur Utama: Mengintip langsung ke dalam folder manga secara real-time
-     * untuk mencari file cover/gambar pertama yang valid agar bisa tampil saat Browse.
+     * Fungsi pembantu untuk mengintip isi folder.
+     * Menggunakan 'network.client' langsung agar bypass dari interceptor utama (mencegah loop).
      */
     private fun peekCoverFromFolder(folderUrl: String): String? {
         return try {
             val safeUrl = if (folderUrl.contains(" ")) folderUrl.replace(" ", "%20") else folderUrl
-            val response = client.newCall(GET(safeUrl, headers)).execute()
+            val peekRequest = Request.Builder().url(safeUrl).headers(headers).build()
+            val response = network.client.newCall(peekRequest).execute()
             if (!response.isSuccessful) return null
             
             val document = response.asJsoup()
@@ -103,9 +131,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                 href.contains("cover") || href.contains("poster") || href.contains("thumb")
             } ?: imageLinks.firstOrNull()
 
-            coverElement?.absUrl("href")?.let { absUrl ->
-                absUrl.toHttpUrlOrNull()?.toString() ?: absUrl.replace(" ", "%20")
-            }
+            coverElement?.absUrl("href")
         } catch (e: Exception) {
             null
         }
@@ -117,6 +143,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
+        val baseHttpUrl = baseUrl.toHttpUrlOrNull()
+        
         val mangas = document.select("a[href]")
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
             .map { element ->
@@ -128,8 +156,13 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    thumbnail_url = peekCoverFromFolder(absUrl) 
-                        ?: (absUrl.removeSuffix("/") + "/${defaultCoverName.trim()}").replace(" ", "%20")
+                    // Tandai URL thumbnail dengan query khusus agar ditangkap oleh Interceptor secara lazy
+                    thumbnail_url = baseHttpUrl?.newBuilder()?.apply {
+                        relUrl.split("/").filter { it.isNotEmpty() }.forEach { segment ->
+                            addPathSegment(segment)
+                        }
+                        addQueryParameter("localstream_cover", "true")
+                    }?.build()?.toString()
                 }
             }
         return MangasPage(mangas, false)
@@ -144,6 +177,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     override fun searchMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
         val query = response.request.url.fragment?.lowercase() ?: ""
+        val baseHttpUrl = baseUrl.toHttpUrlOrNull()
         
         val mangas = document.select("a[href]")
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
@@ -157,8 +191,13 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    thumbnail_url = peekCoverFromFolder(absUrl) 
-                        ?: (absUrl.removeSuffix("/") + "/${defaultCoverName.trim()}").replace(" ", "%20")
+                    // Tandai URL thumbnail dengan query khusus agar ditangkap oleh Interceptor secara lazy
+                    thumbnail_url = baseHttpUrl?.newBuilder()?.apply {
+                        relUrl.split("/").filter { it.isNotEmpty() }.forEach { segment ->
+                            addPathSegment(segment)
+                        }
+                        addQueryParameter("localstream_cover", "true")
+                    }?.build()?.toString()
                 }
             }
         return MangasPage(mangas, false)
