@@ -78,61 +78,89 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     // ─── Browse / Popular ────────────────────────────────────────────────────
 
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/", headers)
+    // Mengirimkan nomor halaman ke fragment URL lokal agar bisa dibaca saat parsing
+    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/#page=$page", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
+        val fragment = response.request.url.fragment ?: ""
+        val currentPage = fragment.substringAfter("page=").toIntOrNull() ?: 1
+        val itemsPerPage = 24 // Jumlah item per halaman
+
         val document = response.asJsoup()
-        val mangas = document.select("a[href]")
+        val allElements = document.select("a[href]")
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
-            .map { element ->
-                SManga.create().apply {
-                    title = element.text().removeSuffix("/")
-                    val absUrl = element.absUrl("href")
-                    
-                    // FIX: Paksa encoding %2B untuk tanda plus agar tidak diratakan oleh OkHttp
-                    val fixedAbsUrl = absUrl.replace("+", "%2B").replace(" ", "%20")
-                    
-                    var relUrl = fixedAbsUrl.removePrefix(baseUrl)
-                    if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
-                    url = relUrl
-                    
-                    val cleanAbsUrl = fixedAbsUrl.removeSuffix("/")
-                    thumbnail_url = "$cleanAbsUrl/${defaultCoverName.trim()}"
-                }
+
+        val startIndex = (currentPage - 1) * itemsPerPage
+        val endIndex = minOf(startIndex + itemsPerPage, allElements.size)
+
+        if (startIndex >= allElements.size) {
+            return MangasPage(emptyList(), false)
+        }
+
+        val pagedElements = allElements.subList(startIndex, endIndex)
+        val mangas = pagedElements.map { element ->
+            SManga.create().apply {
+                title = element.text().removeSuffix("/")
+                val absUrl = element.absUrl("href")
+                val fixedAbsUrl = absUrl.replace("+", "%2B").replace(" ", "%20")
+                
+                var relUrl = fixedAbsUrl.removePrefix(baseUrl)
+                if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
+                url = relUrl
+                
+                val cleanAbsUrl = fixedAbsUrl.removeSuffix("/")
+                thumbnail_url = "$cleanAbsUrl/${defaultCoverName.trim()}"
             }
-        return MangasPage(mangas, false)
+        }
+
+        val hasNextPage = endIndex < allElements.size
+        return MangasPage(mangas, hasNextPage)
     }
 
     // ─── Search ──────────────────────────────────────────────────────────────
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        return GET("$baseUrl/#query=${query.lowercase()}", headers)
+        // Menggabungkan query pencarian dan halaman ke dalam fragment URL
+        return GET("$baseUrl/#query=${query.lowercase()}&page=$page", headers)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
+        val fragment = response.request.url.fragment ?: ""
+        // FIX: Mengambil nilai kata kunci murni di antara "query=" dan sebelum "&page="
+        val query = fragment.substringAfter("query=").substringBefore("&page=").lowercase()
+        val currentPage = fragment.substringAfter("page=").toIntOrNull() ?: 1
+        val itemsPerPage = 24
+
         val document = response.asJsoup()
-        val query = response.request.url.fragment?.lowercase() ?: ""
-        
-        val mangas = document.select("a[href]")
+        val filteredElements = document.select("a[href]")
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
             .filter { it.text().lowercase().contains(query) }
-            .map { element ->
-                SManga.create().apply {
-                    title = element.text().removeSuffix("/")
-                    val absUrl = element.absUrl("href")
-                    
-                    // FIX: Paksa encoding %2B dan %20 secara manual
-                    val fixedAbsUrl = absUrl.replace("+", "%2B").replace(" ", "%20")
-                    
-                    var relUrl = fixedAbsUrl.removePrefix(baseUrl)
-                    if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
-                    url = relUrl
-                    
-                    val cleanAbsUrl = fixedAbsUrl.removeSuffix("/")
-                    thumbnail_url = "$cleanAbsUrl/${defaultCoverName.trim()}"
-                }
+
+        val startIndex = (currentPage - 1) * itemsPerPage
+        val endIndex = minOf(startIndex + itemsPerPage, filteredElements.size)
+
+        if (startIndex >= filteredElements.size) {
+            return MangasPage(emptyList(), false)
+        }
+
+        val pagedElements = filteredElements.subList(startIndex, endIndex)
+        val mangas = pagedElements.map { element ->
+            SManga.create().apply {
+                title = element.text().removeSuffix("/")
+                val absUrl = element.absUrl("href")
+                val fixedAbsUrl = absUrl.replace("+", "%2B").replace(" ", "%20")
+                
+                var relUrl = fixedAbsUrl.removePrefix(baseUrl)
+                if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
+                url = relUrl
+                
+                val cleanAbsUrl = fixedAbsUrl.removeSuffix("/")
+                thumbnail_url = "$cleanAbsUrl/${defaultCoverName.trim()}"
             }
-        return MangasPage(mangas, false)
+        }
+
+        val hasNextPage = endIndex < filteredElements.size
+        return MangasPage(mangas, hasNextPage)
     }
 
     // ─── Manga Details ───────────────────────────────────────────────────────
@@ -157,7 +185,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             status = SManga.UNKNOWN
             if (coverElement != null) {
                 val absUrl = coverElement.absUrl("href")
-                // FIX: Menghindari auto-flattening OkHttp
                 thumbnail_url = absUrl.replace("+", "%2B").replace(" ", "%20")
             }
             initialized = true
@@ -187,7 +214,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     name = element.text().removeSuffix("/")
                     val absUrl = element.absUrl("href")
                     
-                    // FIX: Terapkan sanitasi link pada level chapter agar request ke page-list aman
                     val fixedAbsUrl = absUrl.replace("+", "%2B").replace(" ", "%20")
                     var relUrl = fixedAbsUrl.removePrefix(baseUrl)
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
@@ -222,7 +248,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
         return sortedPages.mapIndexed { index, element ->
             val absUrl = element.absUrl("href")
-            // FIX: Bypass toHttpUrlOrNull karena rentan merubah %2B menjadi + literal
             val validUrl = absUrl.replace("+", "%2B").replace(" ", "%20")
             Page(index, "", validUrl)
         }
