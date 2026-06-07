@@ -19,6 +19,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.net.URLDecoder
 
 class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
@@ -54,33 +55,33 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         screen.addPreference(coverNamePref)
     }
 
-    // ─── Helpers: The Ultimate URL Encoder ───────────────────────────────────
+    // ─── Helpers: Manual Percent-Encoding untuk kecocokan 100% ──────────────
 
-    // Membongkar, membersihkan, dan merakit ulang URL setara Google Chrome
     private fun getEncodedCoverUrl(rawAbsUrl: String, coverName: String): String {
-        val cleanedUrl = rawAbsUrl.removeSuffix("/")
-        val segments = cleanedUrl.split("/")
+        val baseUrlNoSuffix = baseUrl.removeSuffix("/")
+        val path = rawAbsUrl.removePrefix(baseUrlNoSuffix)
         
-        val encodedSegments = segments.mapIndexed { index, segment ->
-            if (index < 3) { 
-                // Biarkan "http:", "", dan "127.0.0.1:8080" apa adanya
-                segment 
-            } else {
-                // 1. Decode dulu untuk mencegah double-encoding dari server
-                val decodedSegment = try {
-                    java.net.URLDecoder.decode(segment, "UTF-8")
-                } catch (e: Exception) {
-                    segment // Fallback jika string kacau
-                }
-                // 2. Encode ulang dengan ketat
-                java.net.URLEncoder.encode(decodedSegment, "UTF-8").replace("+", "%20")
-            }
+        val segments = path.split("/").filter { it.isNotEmpty() }
+        
+        val encodedPath = segments.joinToString("/") { segment ->
+            val decoded = try { URLDecoder.decode(segment, "UTF-8") } catch (e: Exception) { segment }
+            // Manual Percent-Encoding: Hanya replace karakter yang krusial
+            decoded.replace(" ", "%20")
+                   .replace("[", "%5B")
+                   .replace("]", "%5D")
+                   .replace("(", "%28")
+                   .replace(")", "%29")
+                   // Kita sengaja tidak me-replace '~' dan '+' agar sama persis dengan Round Sync
         }
         
-        val encodedBase = encodedSegments.joinToString("/")
-        val encodedCover = java.net.URLEncoder.encode(coverName.trim(), "UTF-8").replace("+", "%20")
-        
-        return "$encodedBase/$encodedCover"
+        val encodedCover = coverName.trim()
+            .replace(" ", "%20")
+            .replace("[", "%5B")
+            .replace("]", "%5D")
+            .replace("(", "%28")
+            .replace(")", "%29")
+
+        return "$baseUrlNoSuffix/$encodedPath/$encodedCover"
     }
 
     // ─── Helpers: Natural Sort ───────────────────────────────────────────────
@@ -116,20 +117,9 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             .map { element ->
                 SManga.create().apply {
                     val rawHref = element.attr("href").removeSuffix("/")
-                    // Dapatkan judul asli langsung dari href agar tidak kena truncate HTML
-                    title = try {
-                        java.net.URLDecoder.decode(rawHref.split("/").last(), "UTF-8")
-                    } catch (e: Exception) {
-                        element.text().removeSuffix("/")
-                    }
-                    
+                    title = try { URLDecoder.decode(rawHref.split("/").last(), "UTF-8") } catch (e: Exception) { element.text().removeSuffix("/") }
                     val absUrl = element.absUrl("href")
-                    
-                    var relUrl = absUrl.removePrefix(baseUrl)
-                    if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
-                    url = relUrl
-                    
-                    // Gunakan peluru perak kita
+                    url = absUrl.removePrefix(baseUrl)
                     thumbnail_url = getEncodedCoverUrl(absUrl, defaultCoverName)
                 }
             }
@@ -145,28 +135,18 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     override fun searchMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
         val query = response.request.url.fragment?.lowercase() ?: ""
-        
         val mangas = document.select("a[href]")
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
             .filter { 
-                val decodedName = try { java.net.URLDecoder.decode(it.attr("href"), "UTF-8") } catch (e: Exception) { it.text() }
+                val decodedName = try { URLDecoder.decode(it.attr("href"), "UTF-8") } catch (e: Exception) { it.text() }
                 decodedName.lowercase().contains(query) 
             }
             .map { element ->
                 SManga.create().apply {
                     val rawHref = element.attr("href").removeSuffix("/")
-                    title = try {
-                        java.net.URLDecoder.decode(rawHref.split("/").last(), "UTF-8")
-                    } catch (e: Exception) {
-                        element.text().removeSuffix("/")
-                    }
-                    
+                    title = try { URLDecoder.decode(rawHref.split("/").last(), "UTF-8") } catch (e: Exception) { element.text().removeSuffix("/") }
                     val absUrl = element.absUrl("href")
-                    
-                    var relUrl = absUrl.removePrefix(baseUrl)
-                    if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
-                    url = relUrl
-                    
+                    url = absUrl.removePrefix(baseUrl)
                     thumbnail_url = getEncodedCoverUrl(absUrl, defaultCoverName)
                 }
             }
@@ -176,13 +156,9 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     // ─── Manga Details ───────────────────────────────────────────────────────
 
     override fun mangaDetailsParse(document: Document): SManga {
-        val links = document.select("a[href]")
-        val imageLinks = links.filter { 
+        val imageLinks = document.select("a[href]").filter { 
             val href = it.attr("href").lowercase()
-            !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".jpeg") || 
-                                     href.endsWith(".png") || href.endsWith(".webp") || 
-                                     href.endsWith(".avif") || href.endsWith(".gif") || 
-                                     href.endsWith(".heic") || href.endsWith(".jxl"))
+            !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".jpeg") || href.endsWith(".png") || href.endsWith(".webp"))
         }
 
         val coverElement = imageLinks.find { 
@@ -191,14 +167,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         } ?: imageLinks.firstOrNull()
 
         return SManga.create().apply {
-            description = "Folder manga lokal dari Server LocalStream (WebDAV/HTTP)."
+            description = "Folder manga lokal dari Server LocalStream."
             status = SManga.UNKNOWN
             if (coverElement != null) {
-                // Terapkan sistem yang sama persis agar konsisten
-                val absUrl = coverElement.absUrl("href")
-                val filename = absUrl.split("/").last()
-                val parentUrl = absUrl.substringBeforeLast("/")
-                thumbnail_url = getEncodedCoverUrl(parentUrl, filename)
+                thumbnail_url = getEncodedCoverUrl(coverElement.absUrl("href"), coverElement.attr("href").split("/").last())
             }
             initialized = true
         }
@@ -210,33 +182,18 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
-        
         val chapterElements = document.select("a[href]")
-            .filter { element ->
-                val href = element.attr("href").lowercase()
-                !href.contains("..") && (href.endsWith("/") || href.endsWith(".cbz") || href.endsWith(".zip"))
-            }
+            .filter { !it.attr("href").contains("..") && (it.attr("href").endsWith("/") || it.attr("href").endsWith(".cbz") || it.attr("href").endsWith(".zip")) }
 
         val comparator = naturalSortComparator()
-        val sortedElements = chapterElements.sortedWith { a, b -> 
-            comparator.compare(a.text(), b.text()) 
-        }
-
-        return sortedElements.mapIndexed { index, element ->
-                SChapter.create().apply {
-                    val rawHref = element.attr("href").removeSuffix("/")
-                    name = try {
-                        java.net.URLDecoder.decode(rawHref.split("/").last(), "UTF-8")
-                    } catch (e: Exception) {
-                        element.text().removeSuffix("/")
-                    }
-                    val absUrl = element.absUrl("href")
-                    var relUrl = absUrl.removePrefix(baseUrl)
-                    if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
-                    url = relUrl
-                    chapter_number = (index + 1).toFloat()
-                }
-            }.reversed() 
+        return chapterElements.sortedWith { a, b -> comparator.compare(a.text(), b.text()) }.mapIndexed { index, element ->
+            SChapter.create().apply {
+                val rawHref = element.attr("href").removeSuffix("/")
+                name = try { URLDecoder.decode(rawHref.split("/").last(), "UTF-8") } catch (e: Exception) { element.text().removeSuffix("/") }
+                url = element.absUrl("href").removePrefix(baseUrl)
+                chapter_number = (index + 1).toFloat()
+            }
+        }.reversed()
     }
 
     // ─── Page List ───────────────────────────────────────────────────────────
@@ -245,32 +202,20 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
-        val pageElements = document.select("a[href]")
-            .filter { element ->
-                val href = element.attr("href").lowercase()
-                val isImage = href.endsWith(".jpg") || href.endsWith(".png") || 
-                              href.endsWith(".jpeg") || href.endsWith(".webp") || 
-                              href.endsWith(".avif") || href.endsWith(".gif") || 
-                              href.endsWith(".heic") || href.endsWith(".jxl") || 
-                              href.endsWith(".bmp")
-                !href.contains("..") && isImage
-            }
-
-        val comparator = naturalSortComparator()
-        val sortedPages = pageElements.sortedWith { a, b -> 
-            comparator.compare(a.text(), b.text()) 
+        val pageElements = document.select("a[href]").filter { 
+            val href = it.attr("href").lowercase()
+            !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".png") || href.endsWith(".webp") || href.endsWith(".jpeg"))
         }
 
-        return sortedPages.mapIndexed { index, element ->
+        val comparator = naturalSortComparator()
+        return pageElements.sortedWith { a, b -> comparator.compare(a.text(), b.text()) }.mapIndexed { index, element ->
             val absUrl = element.absUrl("href")
             val filename = absUrl.split("/").last()
             val parentUrl = absUrl.substringBeforeLast("/")
-            val validUrl = getEncodedCoverUrl(parentUrl, filename)
-            Page(index, "", validUrl)
+            Page(index, "", getEncodedCoverUrl(parentUrl, filename))
         }
     }
 
-    // ─── Abstract Methods ────────────────────────────────────────────────────
     override fun popularMangaSelector(): String = ""
     override fun popularMangaFromElement(element: Element): SManga = SManga.create()
     override fun popularMangaNextPageSelector(): String? = null
