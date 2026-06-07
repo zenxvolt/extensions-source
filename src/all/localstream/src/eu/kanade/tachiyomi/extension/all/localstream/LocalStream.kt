@@ -95,14 +95,18 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    val cleanAbsUrl = absUrl.removeSuffix("/")
-                    // Menggunakan extension function toHttpUrlOrNull()
-                    val parsedUrl = cleanAbsUrl.toHttpUrlOrNull()
-                    
-                    thumbnail_url = parsedUrl?.newBuilder()
-                        ?.addPathSegment(defaultCoverName.trim())
-                        ?.build()
-                        ?.toString() ?: "$cleanAbsUrl/${defaultCoverName.trim()}"
+                    val baseHttpUrl = baseUrl.toHttpUrlOrNull()
+                    if (baseHttpUrl != null) {
+                        val builder = baseHttpUrl.newBuilder()
+                        relUrl.split("/").filter { it.isNotEmpty() }.forEach { segment ->
+                            builder.addPathSegment(segment)
+                        }
+                        builder.addPathSegment(defaultCoverName.trim())
+                        thumbnail_url = builder.build().toString()
+                    } else {
+                        val cleanAbsUrl = absUrl.removeSuffix("/")
+                        thumbnail_url = "$cleanAbsUrl/${defaultCoverName.trim()}".replace(" ", "%20")
+                    }
                 }
             }
         return MangasPage(mangas, false)
@@ -130,13 +134,18 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    val cleanAbsUrl = absUrl.removeSuffix("/")
-                    val parsedUrl = cleanAbsUrl.toHttpUrlOrNull()
-                    
-                    thumbnail_url = parsedUrl?.newBuilder()
-                        ?.addPathSegment(defaultCoverName.trim())
-                        ?.build()
-                        ?.toString() ?: "$cleanAbsUrl/${defaultCoverName.trim()}"
+                    val baseHttpUrl = baseUrl.toHttpUrlOrNull()
+                    if (baseHttpUrl != null) {
+                        val builder = baseHttpUrl.newBuilder()
+                        relUrl.split("/").filter { it.isNotEmpty() }.forEach { segment ->
+                            builder.addPathSegment(segment)
+                        }
+                        builder.addPathSegment(defaultCoverName.trim())
+                        thumbnail_url = builder.build().toString()
+                    } else {
+                        val cleanAbsUrl = absUrl.removeSuffix("/")
+                        thumbnail_url = "$cleanAbsUrl/${defaultCoverName.trim()}".replace(" ", "%20")
+                    }
                 }
             }
         return MangasPage(mangas, false)
