@@ -149,7 +149,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val mangas = document.select("a[href]")
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
             .filter { 
-                val decodedName = try { java.net.URLDecoder.decode(it.attr("href"), "UTF-8") } else { it.text() }
+                val decodedName = try { java.net.URLDecoder.decode(it.attr("href"), "UTF-8") } catch (e: Exception) { it.text() }
                 decodedName.lowercase().contains(query) 
             }
             .map { element ->
