@@ -78,18 +78,39 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         Regex("(\\d+|\\D+)").findAll(s).map { it.value }.toList()
 
     /**
-     * Helper untuk membangun URL cover secara aman.
-     * Mengamankan karakter spasi menjadi %20 agar bisa di-load di halaman Browse.
+     * Fitur Utama: Mengintip langsung ke dalam folder manga secara real-time
+     * untuk mencari file cover/gambar pertama yang valid agar bisa tampil saat Browse.
      */
-    private fun constructCoverUrl(relUrl: String): String? {
-        val baseHttpUrl = baseUrl.toHttpUrlOrNull() ?: return null
-        return baseHttpUrl.newBuilder().apply {
-            // Memisahkan path folder dan memasukkannya per segmen agar otomatis di-encode
-            relUrl.split("/").filter { it.isNotEmpty() }.forEach { segment ->
-                addPathSegment(segment)
+    private fun peekCoverFromFolder(folderUrl: String): String? {
+        return try {
+            // Lakukan request HTTP internal secara sinkronus ke folder manga terkait
+            val safeUrl = if (folderUrl.contains(" ")) folderUrl.replace(" ", "%20") else folderUrl
+            val response = client.newCall(GET(safeUrl, headers)).execute()
+            if (!response.isSuccessful) return null
+            
+            val document = response.asJsoup()
+            val links = document.select("a[href]")
+            val imageLinks = links.filter { 
+                val href = it.attr("href").lowercase()
+                !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".jpeg") || 
+                                         href.endsWith(".png") || href.endsWith(".webp") || 
+                                         href.endsWith(".avif") || href.endsWith(".gif") || 
+                                         href.endsWith(".heic") || href.endsWith(".jxl") ||
+                                         href.endsWith(".bmp"))
             }
-            addPathSegment(defaultCoverName.trim())
-        }.build().toString()
+
+            // Cari file yang bernama mengandung kata kunci cover/poster, atau ambil gambar pertama
+            val coverElement = imageLinks.find { 
+                val href = it.attr("href").lowercase()
+                href.contains("cover") || href.contains("poster") || href.contains("thumb")
+            } ?: imageLinks.firstOrNull()
+
+            coverElement?.absUrl("href")?.let { absUrl ->
+                absUrl.toHttpUrlOrNull()?.toString() ?: absUrl.replace(" ", "%20")
+            }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     // ─── Browse / Popular ────────────────────────────────────────────────────
@@ -109,8 +130,9 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    // Menggunakan konstruktor URL aman pembentuk segmen path
-                    thumbnail_url = constructCoverUrl(relUrl) ?: "$absUrl${defaultCoverName.trim()}"
+                    // Cari cover asli di dalam folder, jika gagal baru gunakan fallback tebakan
+                    thumbnail_url = peekCoverFromFolder(absUrl) 
+                        ?: (absUrl.removeSuffix("/") + "/${defaultCoverName.trim()}").replace(" ", "%20")
                 }
             }
         return MangasPage(mangas, false)
@@ -138,8 +160,9 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    // Menggunakan konstruktor URL aman pembentuk segmen path
-                    thumbnail_url = constructCoverUrl(relUrl) ?: "$absUrl${defaultCoverName.trim()}"
+                    // Cari cover asli di dalam folder hasil pencarian
+                    thumbnail_url = peekCoverFromFolder(absUrl) 
+                        ?: (absUrl.removeSuffix("/") + "/${defaultCoverName.trim()}").replace(" ", "%20")
                 }
             }
         return MangasPage(mangas, false)
@@ -153,7 +176,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             val href = it.attr("href").lowercase()
             !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".jpeg") || 
                                      href.endsWith(".png") || href.endsWith(".webp") || 
-                                     href.endsWith(".avif") || href.endsWith(".gif") || 
+                                     幕href.endsWith(".avif") || href.endsWith(".gif") || 
                                      href.endsWith(".heic") || href.endsWith(".jxl"))
         }
 
