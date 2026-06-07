@@ -83,7 +83,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
      */
     private fun peekCoverFromFolder(folderUrl: String): String? {
         return try {
-            // Lakukan request HTTP internal secara sinkronus ke folder manga terkait
             val safeUrl = if (folderUrl.contains(" ")) folderUrl.replace(" ", "%20") else folderUrl
             val response = client.newCall(GET(safeUrl, headers)).execute()
             if (!response.isSuccessful) return null
@@ -99,7 +98,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                                          href.endsWith(".bmp"))
             }
 
-            // Cari file yang bernama mengandung kata kunci cover/poster, atau ambil gambar pertama
             val coverElement = imageLinks.find { 
                 val href = it.attr("href").lowercase()
                 href.contains("cover") || href.contains("poster") || href.contains("thumb")
@@ -130,7 +128,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    // Cari cover asli di dalam folder, jika gagal baru gunakan fallback tebakan
                     thumbnail_url = peekCoverFromFolder(absUrl) 
                         ?: (absUrl.removeSuffix("/") + "/${defaultCoverName.trim()}").replace(" ", "%20")
                 }
@@ -160,7 +157,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    // Cari cover asli di dalam folder hasil pencarian
                     thumbnail_url = peekCoverFromFolder(absUrl) 
                         ?: (absUrl.removeSuffix("/") + "/${defaultCoverName.trim()}").replace(" ", "%20")
                 }
@@ -176,7 +172,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             val href = it.attr("href").lowercase()
             !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".jpeg") || 
                                      href.endsWith(".png") || href.endsWith(".webp") || 
-                                     幕href.endsWith(".avif") || href.endsWith(".gif") || 
+                                     href.endsWith(".avif") || href.endsWith(".gif") || 
                                      href.endsWith(".heic") || href.endsWith(".jxl"))
         }
 
