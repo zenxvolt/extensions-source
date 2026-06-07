@@ -34,7 +34,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     }
 
     override val baseUrl: String
-        get() = preferences.getString(BASE_URL_PREF, "http://127.0.0.1:8080")?.removeSuffix("/")
+        get() = preferences.getString(BASE_URL_PREF, "http://127.0.0.1:8080")
+            ?.removeSuffix("/")
             ?: "http://127.0.0.1:8080"
 
     private val defaultCoverName: String
@@ -43,7 +44,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val baseUrlPref = EditTextPreference(screen.context).apply {
             key = BASE_URL_PREF
-            title = "Server URL (Round Sync / Termux)"
+            title = "Server URL"
             summary = "Masukkan URL lokal dari server file kamu."
             setDefaultValue("http://127.0.0.1:8080")
         }
@@ -52,13 +53,13 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val coverNamePref = EditTextPreference(screen.context).apply {
             key = COVER_NAME_PREF
             title = "Nama File Cover Default"
-            summary = "Harus sama persis dengan nama file cover di folder."
+            summary = "Harus sama persis dengan nama file di dalam folder."
             setDefaultValue("cover.jpg")
         }
         screen.addPreference(coverNamePref)
     }
 
-    // ─── Helpers ────────────────────────────────────────────────────────────
+    // ─── Helpers ─────────────────────────────────────────────────────────────
 
     private fun naturalSortComparator(): Comparator<String> = Comparator { a, b ->
         val tokensA = tokenize(a)
@@ -75,69 +76,107 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             }
             if (cmp != 0) return@Comparator cmp
         }
+
         tokensA.size.compareTo(tokensB.size)
     }
 
     private fun tokenize(s: String): List<String> =
         Regex("(\\d+|\\D+)").findAll(s).map { it.value }.toList()
 
+    private fun looksLikeParentLink(href: String): Boolean {
+        val normalized = href.trim().lowercase()
+        return normalized == ".." || normalized == "../" || normalized.contains("/../")
+    }
+
+    private fun lastPathSegment(raw: String): String {
+        val cleaned = raw.substringBefore('?').substringBefore('#').trimEnd('/')
+        return cleaned.substringAfterLast('/')
+    }
+
+    private fun looksLikeImage(href: String): Boolean {
+        val name = lastPathSegment(href).lowercase()
+        return name.endsWith(".jpg") ||
+            name.endsWith(".jpeg") ||
+            name.endsWith(".png") ||
+            name.endsWith(".webp") ||
+            name.endsWith(".avif") ||
+            name.endsWith(".gif") ||
+            name.endsWith(".heic") ||
+            name.endsWith(".jxl") ||
+            name.endsWith(".bmp")
+    }
+
+    private fun looksLikeArchive(href: String): Boolean {
+        val name = lastPathSegment(href).lowercase()
+        return name.endsWith(".cbz") || name.endsWith(".zip")
+    }
+
     private fun encodePathSegments(path: String): String {
-        val trimmed = path.trim()
+        val trimmed = path.trim().trim('/')
         if (trimmed.isEmpty()) return ""
 
-        val leadingSlash = trimmed.startsWith("/")
-        val trailingSlash = trimmed.endsWith("/")
-
-        val encoded = trimmed
-            .trim('/')
+        return trimmed
             .split('/')
             .filter { it.isNotEmpty() }
             .joinToString("/") { segment ->
                 val decoded = runCatching { Uri.decode(segment) }.getOrDefault(segment)
                 Uri.encode(decoded)
             }
-
-        return buildString {
-            if (leadingSlash) append("/")
-            append(encoded)
-            if (trailingSlash && encoded.isNotEmpty()) append("/")
-        }
     }
 
-    private fun normalizeRelativeUrl(href: String): String {
+    private fun folderPathFromHref(href: String): String {
         val raw = href.trim()
-        if (raw.isEmpty()) return "/"
+        if (raw.isEmpty()) return ""
 
-        return if (raw.startsWith("http://") || raw.startsWith("https://")) {
-            val parsed = raw.toHttpUrlOrNull()
-            if (parsed != null) {
-                parsed.encodedPath.ifBlank { "/" }
-            } else {
-                raw
+        val pathPart = when {
+            raw.startsWith("http://") || raw.startsWith("https://") -> {
+                raw.toHttpUrlOrNull()?.encodedPath ?: raw
             }
-        } else {
-            val encoded = encodePathSegments(raw)
-            if (encoded.startsWith("/")) encoded else "/$encoded"
+            else -> raw
         }
+
+        return encodePathSegments(pathPart)
     }
 
-    private fun buildThumbnailUrl(relativeFolderUrl: String): String {
-        val folder = if (relativeFolderUrl.endsWith("/")) relativeFolderUrl else "$relativeFolderUrl/"
-        val cover = Uri.encode(defaultCoverName.trim())
-        return "$baseUrl$folder$cover"
+    private fun buildFolderUrl(href: String): String {
+        val path = folderPathFromHref(href)
+        return if (path.isEmpty()) "/" else "/$path"
+    }
+
+    private fun buildThumbnailUrl(folderUrl: String): String {
+        val folderPath = folderUrl.trim().trim('/')
+        val coverFile = Uri.encode(defaultCoverName.trim())
+
+        return if (folderPath.isEmpty()) {
+            "$baseUrl/$coverFile"
+        } else {
+            "$baseUrl/$folderPath/$coverFile"
+        }
     }
 
     private fun sanitizeAbsoluteUrl(url: String): String {
         val parsed = url.toHttpUrlOrNull()
-        if (parsed != null) return parsed.toString()
-
-        return url
+        return parsed?.toString() ?: url
             .replace(" ", "%20")
             .replace("'", "%27")
             .replace("\"", "%22")
     }
 
-    // ─── Browse / Popular ───────────────────────────────────────────────────
+    private fun buildMangaFromElement(element: Element): SManga {
+        val folderUrl = buildFolderUrl(element.attr("href"))
+
+        val thumbnailFromListing = element.selectFirst("img[src]")
+            ?.absUrl("src")
+            ?.takeIf { it.isNotBlank() }
+
+        return SManga.create().apply {
+            title = element.text().removeSuffix("/").trim()
+            url = folderUrl
+            thumbnail_url = thumbnailFromListing ?: buildThumbnailUrl(folderUrl)
+        }
+    }
+
+    // ─── Browse / Popular ────────────────────────────────────────────────────
 
     override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/", headers)
 
@@ -145,16 +184,11 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val document = response.asJsoup()
 
         val mangas = document.select("a[href]")
-            .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
-            .map { element ->
-                val folderUrl = normalizeRelativeUrl(element.attr("href"))
-
-                SManga.create().apply {
-                    title = element.text().removeSuffix("/")
-                    url = folderUrl
-                    thumbnail_url = buildThumbnailUrl(folderUrl)
-                }
+            .filter { element ->
+                val href = element.attr("href")
+                !looksLikeParentLink(href) && !looksLikeImage(href) && !looksLikeArchive(href)
             }
+            .map { buildMangaFromElement(it) }
 
         return MangasPage(mangas, false)
     }
@@ -162,25 +196,20 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     // ─── Search ──────────────────────────────────────────────────────────────
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        return GET("$baseUrl/?search=${Uri.encode(query.lowercase())}", headers)
+        return GET("$baseUrl/#query=${Uri.encode(query.lowercase())}", headers)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        val query = response.request.url.queryParameter("search")?.lowercase().orEmpty()
+        val query = response.request.url.fragment?.removePrefix("query=")?.lowercase().orEmpty()
 
         val mangas = document.select("a[href]")
-            .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
-            .filter { it.text().lowercase().contains(query) }
-            .map { element ->
-                val folderUrl = normalizeRelativeUrl(element.attr("href"))
-
-                SManga.create().apply {
-                    title = element.text().removeSuffix("/")
-                    url = folderUrl
-                    thumbnail_url = buildThumbnailUrl(folderUrl)
-                }
+            .filter { element ->
+                val href = element.attr("href")
+                !looksLikeParentLink(href) && !looksLikeImage(href) && !looksLikeArchive(href)
             }
+            .filter { it.text().lowercase().contains(query) }
+            .map { buildMangaFromElement(it) }
 
         return MangasPage(mangas, false)
     }
@@ -188,29 +217,28 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     // ─── Manga Details ───────────────────────────────────────────────────────
 
     override fun mangaDetailsParse(document: Document): SManga {
-        val links = document.select("a[href]")
-        val imageLinks = links.filter {
-            val href = it.attr("href").lowercase()
-            !href.contains("..") && (
-                href.endsWith(".jpg") || href.endsWith(".jpeg") ||
-                href.endsWith(".png") || href.endsWith(".webp") ||
-                href.endsWith(".avif") || href.endsWith(".gif") ||
-                href.endsWith(".heic") || href.endsWith(".jxl")
-            )
+        val mediaUrls = buildList {
+            document.select("a[href]").forEach { el ->
+                val href = el.attr("href")
+                if (looksLikeImage(href)) add(el.absUrl("href"))
+            }
+            document.select("img[src]").forEach { el ->
+                val src = el.attr("src")
+                if (looksLikeImage(src)) add(el.absUrl("src"))
+            }
         }
 
-        val coverElement = imageLinks.find {
-            val href = it.attr("href").lowercase()
-            href.contains("cover") || href.contains("poster") || href.contains("thumb")
-        } ?: imageLinks.firstOrNull()
+        val coverUrl = mediaUrls.firstOrNull { url ->
+            val lower = url.lowercase()
+            lower.contains("cover") || lower.contains("poster") || lower.contains("thumb")
+        } ?: mediaUrls.firstOrNull()
 
         return SManga.create().apply {
             description = "Folder manga lokal dari Server LocalStream."
             status = SManga.UNKNOWN
 
-            if (coverElement != null) {
-                val absUrl = coverElement.absUrl("href")
-                thumbnail_url = sanitizeAbsoluteUrl(absUrl)
+            if (coverUrl != null) {
+                thumbnail_url = sanitizeAbsoluteUrl(coverUrl)
             }
 
             initialized = true
@@ -226,8 +254,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
         val chapterElements = document.select("a[href]")
             .filter { element ->
-                val href = element.attr("href").lowercase()
-                !href.contains("..") && (href.endsWith("/") || href.endsWith(".cbz") || href.endsWith(".zip"))
+                val href = element.attr("href")
+                !looksLikeParentLink(href) &&
+                    !looksLikeImage(href) &&
+                    (href.endsWith("/") || !looksLikeArchive(href))
             }
 
         val comparator = naturalSortComparator()
@@ -236,10 +266,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         }
 
         return sortedElements.mapIndexed { index, element ->
-            val chapterUrl = normalizeRelativeUrl(element.attr("href"))
+            val chapterUrl = buildFolderUrl(element.attr("href"))
 
             SChapter.create().apply {
-                name = element.text().removeSuffix("/")
+                name = element.text().removeSuffix("/").trim()
                 url = chapterUrl
                 chapter_number = (index + 1).toFloat()
             }
@@ -255,13 +285,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
         val pageElements = document.select("a[href]")
             .filter { element ->
-                val href = element.attr("href").lowercase()
-                val isImage = href.endsWith(".jpg") || href.endsWith(".png") ||
-                    href.endsWith(".jpeg") || href.endsWith(".webp") ||
-                    href.endsWith(".avif") || href.endsWith(".gif") ||
-                    href.endsWith(".heic") || href.endsWith(".jxl") ||
-                    href.endsWith(".bmp")
-                !href.contains("..") && isImage
+                val href = element.attr("href")
+                !looksLikeParentLink(href) && looksLikeImage(href)
             }
 
         val comparator = naturalSortComparator()
