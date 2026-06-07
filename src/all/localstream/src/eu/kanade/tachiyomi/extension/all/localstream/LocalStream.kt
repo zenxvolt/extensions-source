@@ -13,7 +13,6 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
@@ -78,6 +77,21 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     private fun tokenize(s: String): List<String> =
         Regex("(\\d+|\\D+)").findAll(s).map { it.value }.toList()
 
+    /**
+     * Helper untuk membangun URL cover secara aman.
+     * Mengamankan karakter spasi menjadi %20 agar bisa di-load di halaman Browse.
+     */
+    private fun constructCoverUrl(relUrl: String): String? {
+        val baseHttpUrl = baseUrl.toHttpUrlOrNull() ?: return null
+        return baseHttpUrl.newBuilder().apply {
+            // Memisahkan path folder dan memasukkannya per segmen agar otomatis di-encode
+            relUrl.split("/").filter { it.isNotEmpty() }.forEach { segment ->
+                addPathSegment(segment)
+            }
+            addPathSegment(defaultCoverName.trim())
+        }.build().toString()
+    }
+
     // ─── Browse / Popular ────────────────────────────────────────────────────
 
     override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/", headers)
@@ -95,14 +109,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    val cleanAbsUrl = absUrl.removeSuffix("/")
-                    // Menggunakan extension function toHttpUrlOrNull()
-                    val parsedUrl = cleanAbsUrl.toHttpUrlOrNull()
-                    
-                    thumbnail_url = parsedUrl?.newBuilder()
-                        ?.addPathSegment(defaultCoverName.trim())
-                        ?.build()
-                        ?.toString() ?: "$cleanAbsUrl/${defaultCoverName.trim()}"
+                    // Menggunakan konstruktor URL aman pembentuk segmen path
+                    thumbnail_url = constructCoverUrl(relUrl) ?: "$absUrl${defaultCoverName.trim()}"
                 }
             }
         return MangasPage(mangas, false)
@@ -130,13 +138,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    val cleanAbsUrl = absUrl.removeSuffix("/")
-                    val parsedUrl = cleanAbsUrl.toHttpUrlOrNull()
-                    
-                    thumbnail_url = parsedUrl?.newBuilder()
-                        ?.addPathSegment(defaultCoverName.trim())
-                        ?.build()
-                        ?.toString() ?: "$cleanAbsUrl/${defaultCoverName.trim()}"
+                    // Menggunakan konstruktor URL aman pembentuk segmen path
+                    thumbnail_url = constructCoverUrl(relUrl) ?: "$absUrl${defaultCoverName.trim()}"
                 }
             }
         return MangasPage(mangas, false)
