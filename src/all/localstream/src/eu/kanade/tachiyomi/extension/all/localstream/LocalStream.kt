@@ -13,7 +13,6 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
@@ -56,6 +55,14 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         screen.addPreference(coverNamePref)
     }
 
+    // ─── Helpers: Perfect URI Encoder ────────────────────────────────────────
+
+    // Memaksa encode semua karakter spesial (termasuk kurung) seperti browser
+    private fun encodeUriComponent(str: String): String {
+        return java.net.URLEncoder.encode(str, "UTF-8")
+            .replace("+", "%20")
+    }
+
     // ─── Helpers: Natural Sort ───────────────────────────────────────────────
 
     private fun naturalSortComparator(): Comparator<String> = Comparator { a, b ->
@@ -88,25 +95,20 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
             .map { element ->
                 SManga.create().apply {
-                    title = element.text().removeSuffix("/")
-                    val absUrl = element.absUrl("href")
+                    val rawFolderName = element.text().removeSuffix("/")
+                    title = rawFolderName
                     
+                    val absUrl = element.absUrl("href")
                     var relUrl = absUrl.removePrefix(baseUrl)
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
-                    url = relUrl
+                    url = relUrl // Biarkan URL folder asli untuk keperluan Chapter
                     
-                    val baseHttpUrl = baseUrl.toHttpUrlOrNull()
-                    if (baseHttpUrl != null) {
-                        val builder = baseHttpUrl.newBuilder()
-                        relUrl.split("/").filter { it.isNotEmpty() }.forEach { segment ->
-                            builder.addPathSegment(segment)
-                        }
-                        builder.addPathSegment(defaultCoverName.trim())
-                        thumbnail_url = builder.build().toString()
-                    } else {
-                        val cleanAbsUrl = absUrl.removeSuffix("/")
-                        thumbnail_url = "$cleanAbsUrl/${defaultCoverName.trim()}".replace(" ", "%20")
-                    }
+                    // Merakit URL cover dengan Strict Encoding (Tanda kurung ikut ter-encode)
+                    val cleanBaseUrl = baseUrl.removeSuffix("/")
+                    val encodedFolder = encodeUriComponent(rawFolderName)
+                    val encodedCover = encodeUriComponent(defaultCoverName.trim())
+                    
+                    thumbnail_url = "$cleanBaseUrl/$encodedFolder/$encodedCover"
                 }
             }
         return MangasPage(mangas, false)
@@ -127,25 +129,19 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             .filter { it.text().lowercase().contains(query) }
             .map { element ->
                 SManga.create().apply {
-                    title = element.text().removeSuffix("/")
-                    val absUrl = element.absUrl("href")
+                    val rawFolderName = element.text().removeSuffix("/")
+                    title = rawFolderName
                     
+                    val absUrl = element.absUrl("href")
                     var relUrl = absUrl.removePrefix(baseUrl)
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    val baseHttpUrl = baseUrl.toHttpUrlOrNull()
-                    if (baseHttpUrl != null) {
-                        val builder = baseHttpUrl.newBuilder()
-                        relUrl.split("/").filter { it.isNotEmpty() }.forEach { segment ->
-                            builder.addPathSegment(segment)
-                        }
-                        builder.addPathSegment(defaultCoverName.trim())
-                        thumbnail_url = builder.build().toString()
-                    } else {
-                        val cleanAbsUrl = absUrl.removeSuffix("/")
-                        thumbnail_url = "$cleanAbsUrl/${defaultCoverName.trim()}".replace(" ", "%20")
-                    }
+                    val cleanBaseUrl = baseUrl.removeSuffix("/")
+                    val encodedFolder = encodeUriComponent(rawFolderName)
+                    val encodedCover = encodeUriComponent(defaultCoverName.trim())
+                    
+                    thumbnail_url = "$cleanBaseUrl/$encodedFolder/$encodedCover"
                 }
             }
         return MangasPage(mangas, false)
