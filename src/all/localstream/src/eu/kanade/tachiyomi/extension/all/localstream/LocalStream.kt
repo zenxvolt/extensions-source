@@ -55,14 +55,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         screen.addPreference(coverNamePref)
     }
 
-    // ─── Helpers: Perfect URI Encoder ────────────────────────────────────────
-
-    // Memaksa encode semua karakter spesial (termasuk kurung) seperti browser
-    private fun encodeUriComponent(str: String): String {
-        return java.net.URLEncoder.encode(str, "UTF-8")
-            .replace("+", "%20")
-    }
-
     // ─── Helpers: Natural Sort ───────────────────────────────────────────────
 
     private fun naturalSortComparator(): Comparator<String> = Comparator { a, b ->
@@ -95,20 +87,21 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
             .map { element ->
                 SManga.create().apply {
-                    val rawFolderName = element.text().removeSuffix("/")
-                    title = rawFolderName
+                    title = element.text().removeSuffix("/")
                     
+                    // Kita ambil URL asli yang diberikan oleh RoundSync
                     val absUrl = element.absUrl("href")
+                    
                     var relUrl = absUrl.removePrefix(baseUrl)
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
-                    url = relUrl // Biarkan URL folder asli untuk keperluan Chapter
+                    url = relUrl
                     
-                    // Merakit URL cover dengan Strict Encoding (Tanda kurung ikut ter-encode)
-                    val cleanBaseUrl = baseUrl.removeSuffix("/")
-                    val encodedFolder = encodeUriComponent(rawFolderName)
-                    val encodedCover = encodeUriComponent(defaultCoverName.trim())
-                    
-                    thumbnail_url = "$cleanBaseUrl/$encodedFolder/$encodedCover"
+                    // Kita tiru persis logika dari mangaDetailsParse yang TERBUKTI berhasil.
+                    // Langsung gabung nama folder dengan cover.jpg, lalu ubah spasi menjadi %20.
+                    val folderUrl = absUrl.removeSuffix("/")
+                    thumbnail_url = "$folderUrl/${defaultCoverName.trim()}"
+                        .replace(" ", "%20")
+                        .replace("#", "%23") // Tambahan aman jika ada karakter hashtag di nama folder
                 }
             }
         return MangasPage(mangas, false)
@@ -129,19 +122,18 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             .filter { it.text().lowercase().contains(query) }
             .map { element ->
                 SManga.create().apply {
-                    val rawFolderName = element.text().removeSuffix("/")
-                    title = rawFolderName
+                    title = element.text().removeSuffix("/")
                     
                     val absUrl = element.absUrl("href")
+                    
                     var relUrl = absUrl.removePrefix(baseUrl)
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
                     
-                    val cleanBaseUrl = baseUrl.removeSuffix("/")
-                    val encodedFolder = encodeUriComponent(rawFolderName)
-                    val encodedCover = encodeUriComponent(defaultCoverName.trim())
-                    
-                    thumbnail_url = "$cleanBaseUrl/$encodedFolder/$encodedCover"
+                    val folderUrl = absUrl.removeSuffix("/")
+                    thumbnail_url = "$folderUrl/${defaultCoverName.trim()}"
+                        .replace(" ", "%20")
+                        .replace("#", "%23")
                 }
             }
         return MangasPage(mangas, false)
@@ -169,7 +161,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             status = SManga.UNKNOWN
             if (coverElement != null) {
                 val absUrl = coverElement.absUrl("href")
-                thumbnail_url = absUrl.toHttpUrlOrNull()?.toString() ?: absUrl.replace(" ", "%20")
+                thumbnail_url = absUrl.toHttpUrlOrNull()?.toString() ?: absUrl.replace(" ", "%20").replace("#", "%23")
             }
             initialized = true
         }
@@ -229,7 +221,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
         return sortedPages.mapIndexed { index, element ->
             val absUrl = element.absUrl("href")
-            val validUrl = absUrl.toHttpUrlOrNull()?.toString() ?: absUrl.replace(" ", "%20")
+            val validUrl = absUrl.toHttpUrlOrNull()?.toString() ?: absUrl.replace(" ", "%20").replace("#", "%23")
             Page(index, "", validUrl)
         }
     }
