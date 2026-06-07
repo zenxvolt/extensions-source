@@ -19,6 +19,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.util.Locale
 
 class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
@@ -76,15 +77,101 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     private fun tokenize(s: String): List<String> =
         Regex("(\\d+|\\D+)").findAll(s).map { it.value }.toList()
 
+    // ─── Helpers: ComicInfo Metadata Parser ──────────────────────────────────
+
+    private fun getComicInfoXml(document: Document): String {
+        val links = document.select("a[href]")
+        
+        // Strategi 1: Cari langsung di dalam folder utama manga
+        val comicInfoLink = links.find { it.attr("href").lowercase(Locale.ROOT).endsWith("comicinfo.xml") }
+        if (comicInfoLink != null) {
+            return downloadUrlContent(comicInfoLink.absUrl("href"))
+        }
+
+        // Strategi 2: Jika tidak ketemu, coba intip ke dalam subfolder pertama (misal folder chapter)
+        val subFolder = links.find { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
+        if (subFolder != null) {
+            try {
+                val fixedSubUrl = subFolder.absUrl("href").replace("+", "%2B").replace(" ", "%20")
+                val subDoc = client.newCall(GET(fixedSubUrl, headers)).execute().asJsoup()
+                val subComicInfoLink = subDoc.select("a[href]").find { it.attr("href").lowercase(Locale.ROOT).endsWith("comicinfo.xml") }
+                if (subComicInfoLink != null) {
+                    return downloadUrlContent(subComicInfoLink.absUrl("href"))
+                }
+            } catch (e: Exception) { }
+        }
+        return ""
+    }
+
+    private fun downloadUrlContent(url: String): String {
+        return try {
+            val fixedUrl = url.replace("+", "%2B").replace(" ", "%20")
+            client.newCall(GET(fixedUrl, headers)).execute().body?.string() ?: ""
+        } catch (e: Exception) { "" }
+    }
+
+    private fun extractXmlTag(xml: String, tag: String): String? {
+        val regex = Regex(
+            "<(?:\\w+:)?$tag(?:\\s+[^>]*)?>(.*?)</(?:\\w+:)?$tag>",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
+        return regex.find(xml)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotBlank() }
+    }
+
+    private fun parseComicInfo(xml: String, manga: SManga) {
+        val series = extractXmlTag(xml, "Series")
+        val summary = extractXmlTag(xml, "Summary")
+            ?.replace("&amp;", "&")
+            ?.replace("&lt;", "<")
+            ?.replace("&gt;", ">")
+            ?.replace("&quot;", "\"")
+            ?.replace("&apos;", "'")
+
+        val writer = extractXmlTag(xml, "Writer")
+        val penciller = extractXmlTag(xml, "Penciller")
+        val publisher = extractXmlTag(xml, "Publisher")
+        val statusStr = extractXmlTag(xml, "PublishingStatusTachiyomi") ?: extractXmlTag(xml, "Status")
+        val genre = extractXmlTag(xml, "Genre")
+        val categories = extractXmlTag(xml, "Categories")
+
+        if (!series.isNullOrBlank()) {
+            manga.title = series
+        }
+        if (!summary.isNullOrBlank()) {
+            manga.description = summary
+        }
+
+        val authorsList = listOfNotNull(writer, penciller, publisher).distinct()
+        manga.author = authorsList.joinToString(" | ").takeIf { it.isNotBlank() } ?: "Unknown"
+        manga.artist = penciller ?: writer ?: "Unknown"
+
+        val allGenres = listOfNotNull(genre, categories)
+            .flatMap { it.split(",") }
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+
+        if (allGenres.isNotEmpty()) {
+            manga.genre = allGenres.joinToString(", ")
+        }
+
+        manga.status = when (statusStr?.lowercase(Locale.ROOT)) {
+            "ongoing", "1" -> SManga.ONGOING
+            "completed", "end", "2" -> SManga.COMPLETED
+            "cancelled", "abandoned", "6" -> SManga.CANCELLED
+            "hiatus" -> SManga.ON_HIATUS
+            else -> SManga.UNKNOWN
+        }
+    }
+
     // ─── Browse / Popular ────────────────────────────────────────────────────
 
-    // Mengirimkan nomor halaman ke fragment URL lokal agar bisa dibaca saat parsing
     override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/#page=$page", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
         val fragment = response.request.url.fragment ?: ""
         val currentPage = fragment.substringAfter("page=").toIntOrNull() ?: 1
-        val itemsPerPage = 24 // Jumlah item per halaman
+        val itemsPerPage = 24
 
         val document = response.asJsoup()
         val allElements = document.select("a[href]")
@@ -120,21 +207,19 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     // ─── Search ──────────────────────────────────────────────────────────────
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        // Menggabungkan query pencarian dan halaman ke dalam fragment URL
-        return GET("$baseUrl/#query=${query.lowercase()}&page=$page", headers)
+        return GET("$baseUrl/#query=${query.lowercase(Locale.ROOT)}&page=$page", headers)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
         val fragment = response.request.url.fragment ?: ""
-        // FIX: Mengambil nilai kata kunci murni di antara "query=" dan sebelum "&page="
-        val query = fragment.substringAfter("query=").substringBefore("&page=").lowercase()
+        val query = fragment.substringAfter("query=").substringBefore("&page=").lowercase(Locale.ROOT)
         val currentPage = fragment.substringAfter("page=").toIntOrNull() ?: 1
         val itemsPerPage = 24
 
         val document = response.asJsoup()
         val filteredElements = document.select("a[href]")
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
-            .filter { it.text().lowercase().contains(query) }
+            .filter { it.text().lowercase(Locale.ROOT).contains(query) }
 
         val startIndex = (currentPage - 1) * itemsPerPage
         val endIndex = minOf(startIndex + itemsPerPage, filteredElements.size)
@@ -168,7 +253,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     override fun mangaDetailsParse(document: Document): SManga {
         val links = document.select("a[href]")
         val imageLinks = links.filter { 
-            val href = it.attr("href").lowercase()
+            val href = it.attr("href").lowercase(Locale.ROOT)
             !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".jpeg") || 
                                      href.endsWith(".png") || href.endsWith(".webp") || 
                                      href.endsWith(".avif") || href.endsWith(".gif") || 
@@ -176,11 +261,11 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         }
 
         val coverElement = imageLinks.find { 
-            val href = it.attr("href").lowercase()
+            val href = it.attr("href").lowercase(Locale.ROOT)
             href.contains("cover") || href.contains("poster") || href.contains("thumb")
         } ?: imageLinks.firstOrNull()
 
-        return SManga.create().apply {
+        val manga = SManga.create().apply {
             description = "Folder manga lokal dari Server LocalStream (WebDAV/HTTP)."
             status = SManga.UNKNOWN
             if (coverElement != null) {
@@ -189,6 +274,14 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             }
             initialized = true
         }
+
+        // Ambil dan pasang metadata dari ComicInfo.xml jika tersedia
+        val comicInfoXml = getComicInfoXml(document)
+        if (comicInfoXml.isNotBlank()) {
+            parseComicInfo(comicInfoXml, manga)
+        }
+
+        return manga
     }
 
     // ─── Chapter List ────────────────────────────────────────────────────────
@@ -200,7 +293,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         
         val chapterElements = document.select("a[href]")
             .filter { element ->
-                val href = element.attr("href").lowercase()
+                val href = element.attr("href").lowercase(Locale.ROOT)
                 !href.contains("..") && (href.endsWith("/") || href.endsWith(".cbz") || href.endsWith(".zip"))
             }
 
@@ -232,7 +325,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val document = response.asJsoup()
         val pageElements = document.select("a[href]")
             .filter { element ->
-                val href = element.attr("href").lowercase()
+                val href = element.attr("href").lowercase(Locale.ROOT)
                 val isImage = href.endsWith(".jpg") || href.endsWith(".png") || 
                               href.endsWith(".jpeg") || href.endsWith(".webp") || 
                               href.endsWith(".avif") || href.endsWith(".gif") || 
