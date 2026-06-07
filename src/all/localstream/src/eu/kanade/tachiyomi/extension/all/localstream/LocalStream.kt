@@ -58,7 +58,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     // ─── Helpers ────────────────────────────────────────────────────────────
 
-    // Mengambil relative path yang aman tanpa menghilangkan struktur folder
+    // Mengambil relative path untuk internal router Tachiyomi (mencegah 404)
     private fun getRelativePath(element: Element): String {
         val absUrl = element.absUrl("href")
         return if (absUrl.startsWith(baseUrl)) {
@@ -68,14 +68,16 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         }
     }
 
-    // Membangun URL cover secara aman tanpa double-encoding
-    private fun buildThumbnailUrl(mangaUrl: String): String {
-        val folderUrl = (baseUrl + mangaUrl).trimEnd('/')
-        val url = folderUrl.toHttpUrlOrNull() ?: return "$folderUrl/$defaultCoverName"
-        return url.newBuilder().addPathSegment(defaultCoverName.trim()).build().toString()
+    // Menggabungkan URL absolut folder dari Jsoup dengan nama file cover secara aman
+    private fun cleanCoverUrl(absFolderUrl: String): String {
+        val base = absFolderUrl.trimEnd('/')
+        val cover = defaultCoverName.trim()
+        return "$base/$cover"
+            .replace(" ", "%20")
+            .replace("[", "%5B")
+            .replace("]", "%5D")
     }
 
-    // Cache Regex di luar fungsi agar tidak membebani performa saat sorting
     private val tokenRegex = Regex("(\\d+|\\D+)")
 
     private fun tokenize(s: String): List<String> =
@@ -106,12 +108,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val mangas = document.select("a[href]")
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
             .map { element ->
-                val relativePath = getRelativePath(element)
-
                 SManga.create().apply {
                     title = element.text().removeSuffix("/")
-                    url = relativePath
-                    thumbnail_url = buildThumbnailUrl(relativePath)
+                    url = getRelativePath(element)
+                    thumbnail_url = cleanCoverUrl(element.absUrl("href")) // Langsung pakai URL absolut dari Jsoup
                 }
             }
 
@@ -121,7 +121,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     // ─── Search ──────────────────────────────────────────────────────────────
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        // OkHttp HttpUrl akan meng-handle parameter query dengan aman
         val url = baseUrl.toHttpUrlOrNull()?.newBuilder()
             ?.addQueryParameter("search", query.lowercase())
             ?.build()?.toString() ?: "$baseUrl/?search=$query"
@@ -137,12 +136,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
             .filter { it.text().lowercase().contains(query) }
             .map { element ->
-                val relativePath = getRelativePath(element)
-
                 SManga.create().apply {
                     title = element.text().removeSuffix("/")
-                    url = relativePath
-                    thumbnail_url = buildThumbnailUrl(relativePath)
+                    url = getRelativePath(element)
+                    thumbnail_url = cleanCoverUrl(element.absUrl("href")) // Langsung pakai URL absolut dari Jsoup
                 }
             }
 
@@ -173,8 +170,11 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             status = SManga.UNKNOWN
 
             if (coverElement != null) {
-                // Jsoup absUrl sudah cukup kuat tanpa butuh sanitize manual
+                // Berikan proteksi sanitasi yang sama agar tidak ada resiko blank saat dibuka
                 thumbnail_url = coverElement.absUrl("href")
+                    .replace(" ", "%20")
+                    .replace("[", "%5B")
+                    .replace("]", "%5D")
             }
 
             initialized = true
@@ -194,7 +194,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                 !href.contains("..") && (href.endsWith("/") || href.endsWith(".cbz") || href.endsWith(".zip"))
             }
 
-        // Optimasi sorting agar tidak memakan CPU / menyebabkan ngelag
         val sortedElements = chapterElements
             .map { it to tokenize(it.text()) }
             .sortedWith { a, b -> compareTokens(a.second, b.second) }
@@ -203,7 +202,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         return sortedElements.mapIndexed { index, element ->
             SChapter.create().apply {
                 name = element.text().removeSuffix("/")
-                url = getRelativePath(element) // Sekarang parent folder akan dipertahankan
+                url = getRelativePath(element)
                 chapter_number = (index + 1).toFloat()
             }
         }.reversed()
@@ -227,14 +226,18 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                 !href.contains("..") && isImage
             }
 
-        // Optimasi sorting untuk page list
         val sortedPages = pageElements
             .map { it to tokenize(it.text()) }
             .sortedWith { a, b -> compareTokens(a.second, b.second) }
             .map { it.first }
 
         return sortedPages.mapIndexed { index, element ->
-            Page(index, "", element.absUrl("href"))
+            // Menambahkan sanitasi pada link halaman komik agar gambar di dalam chapter tidak blank
+            val validUrl = element.absUrl("href")
+                .replace(" ", "%20")
+                .replace("[", "%5B")
+                .replace("]", "%5D")
+            Page(index, "", validUrl)
         }
     }
 
