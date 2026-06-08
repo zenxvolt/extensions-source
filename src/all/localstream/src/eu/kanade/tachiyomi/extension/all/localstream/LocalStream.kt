@@ -13,6 +13,8 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -20,7 +22,6 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
-import java.net.URLEncoder
 import java.util.Locale
 
 class LocalStream : ParsedHttpSource(), ConfigurableSource {
@@ -48,21 +49,20 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             val urlString = originalRequest.url.toString()
             val coverBase = defaultCoverName.substringBeforeLast(".").trim()
             
-            // Jika request gambar cover menghasilkan 404, cari ekstensi alternatif di latar belakang
             if (response.code == 404 && urlString.contains("/$coverBase.", ignoreCase = true)) {
                 val extensions = listOf("jpg", "jpeg", "png", "webp", "avif", "gif")
                 val currentExt = urlString.substringAfterLast(".").lowercase(Locale.ROOT)
                 
                 for (ext in extensions) {
                     if (ext == currentExt) continue
-                    response.close() // Tutup response 404 sebelumnya
+                    response.close()
                     
                     val newUrl = urlString.substringBeforeLast(".") + "." + ext
                     val newRequest = originalRequest.newBuilder().url(newUrl).build()
                     response = chain.proceed(newRequest)
                     
                     if (response.isSuccessful) {
-                        break // Berhenti jika gambar dengan format ini sukses dimuat
+                        break
                     }
                 }
             }
@@ -86,6 +86,26 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             setDefaultValue("cover.jpg")
         }
         screen.addPreference(coverNamePref)
+    }
+
+    // ─── Helpers: Valid Element Filter ───────────────────────────────────────
+
+    // Fungsi ini memastikan "Parent Directory", "/", atau ".." diblokir sepenuhnya
+    private fun isValidElement(element: Element): Boolean {
+        val text = element.text()
+        val href = element.attr("href")
+        
+        if (text.isBlank() || text == "/") return false
+        if (text.contains("..") || href.contains("..")) return false
+        if (text.equals("Parent Directory", ignoreCase = true)) return false
+        if (text.equals("Parent Directory/", ignoreCase = true)) return false
+        
+        // Blokir kolom header tabel bawaan server
+        if (text.equals("Name", ignoreCase = true) || text.equals("Last modified", ignoreCase = true) || 
+            text.equals("Size", ignoreCase = true) || text.equals("Description", ignoreCase = true)) {
+            return false
+        }
+        return true
     }
 
     // ─── Helpers: Natural Sort ───────────────────────────────────────────────
@@ -112,32 +132,35 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     // ─── Helpers: ComicInfo Metadata Parser ──────────────────────────────────
 
-    private fun getComicInfoXml(document: Document, currentUrl: String): String {
+    private fun getComicInfoXml(document: Document, currentUrlObj: okhttp3.HttpUrl): String {
         val links = document.select("a")
         
-        val comicInfoLink = links.find { it.text().lowercase(Locale.ROOT).endsWith("comicinfo.xml") }
+        val comicInfoLink = links.find { 
+            it.text().lowercase(Locale.ROOT).endsWith("comicinfo.xml") || 
+            it.attr("href").lowercase(Locale.ROOT).endsWith("comicinfo.xml") 
+        }
+        
         if (comicInfoLink != null) {
-            val encodedName = URLEncoder.encode(comicInfoLink.text(), "UTF-8").replace("+", "%20")
-            return downloadUrlContent("${currentUrl.removeSuffix("/")}/$encodedName")
+            val fileUrl = currentUrlObj.newBuilder().addPathSegment(comicInfoLink.text()).build().toString()
+            return downloadUrlContent(fileUrl)
         }
 
-        val subFolder = links.find { 
-            val text = it.text()
-            text.isNotBlank() && text != "../" && text != ".." && text.endsWith("/") 
-        }
+        val subFolder = links.find { isValidElement(it) && it.text().endsWith("/") }
         
         if (subFolder != null) {
             try {
                 val cleanSubName = subFolder.text().removeSuffix("/")
-                val encodedFolder = URLEncoder.encode(cleanSubName, "UTF-8").replace("+", "%20")
-                val subUrl = "${currentUrl.removeSuffix("/")}/$encodedFolder/"
+                val subUrlObj = currentUrlObj.newBuilder().addPathSegment(cleanSubName).addPathSegment("").build()
                 
-                val subDoc = client.newCall(GET(subUrl, headers)).execute().asJsoup()
-                val subComicInfoLink = subDoc.select("a").find { it.text().lowercase(Locale.ROOT).endsWith("comicinfo.xml") }
+                val subDoc = client.newCall(GET(subUrlObj.toString(), headers)).execute().asJsoup()
+                val subComicInfoLink = subDoc.select("a").find { 
+                    it.text().lowercase(Locale.ROOT).endsWith("comicinfo.xml") || 
+                    it.attr("href").lowercase(Locale.ROOT).endsWith("comicinfo.xml") 
+                }
                 
                 if (subComicInfoLink != null) {
-                    val encodedSubName = URLEncoder.encode(subComicInfoLink.text(), "UTF-8").replace("+", "%20")
-                    return downloadUrlContent("${subUrl.removeSuffix("/")}/$encodedSubName")
+                    val subFileUrl = subUrlObj.newBuilder().addPathSegment(subComicInfoLink.text()).build().toString()
+                    return downloadUrlContent(subFileUrl)
                 }
             } catch (e: Exception) { }
         }
@@ -214,11 +237,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val itemsPerPage = 24
 
         val document = response.asJsoup()
-        val allElements = document.select("a")
-            .filter { 
-                val text = it.text()
-                text.isNotBlank() && text != "../" && text != ".." && text.endsWith("/") 
-            }
+        val allElements = document.select("a").filter { isValidElement(it) && it.text().endsWith("/") }
 
         val startIndex = (currentPage - 1) * itemsPerPage
         val endIndex = minOf(startIndex + itemsPerPage, allElements.size)
@@ -228,17 +247,19 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         }
 
         val pagedElements = allElements.subList(startIndex, endIndex)
+        val baseUrlObj = baseUrl.toHttpUrl()
+        
         val mangas = pagedElements.map { element ->
             SManga.create().apply {
-                val folderName = element.text()
-                val cleanName = folderName.removeSuffix("/")
+                val cleanName = element.text().removeSuffix("/")
                 title = cleanName
                 
-                val encodedFolder = URLEncoder.encode(cleanName, "UTF-8").replace("+", "%20")
-                url = "/$encodedFolder/"
+                // Gunakan addPathSegment bawaan HttpUrl untuk encode URL yang 100% aman
+                val mangaUrlObj = baseUrlObj.newBuilder().addPathSegment(cleanName).addPathSegment("").build()
+                url = mangaUrlObj.encodedPath
                 
-                val cleanBaseUrl = baseUrl.removeSuffix("/")
-                thumbnail_url = "$cleanBaseUrl/$encodedFolder/${defaultCoverName.trim()}"
+                val coverUrlObj = baseUrlObj.newBuilder().addPathSegment(cleanName).addPathSegment(defaultCoverName.trim()).build()
+                thumbnail_url = coverUrlObj.toString()
             }
         }
 
@@ -260,10 +281,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
         val document = response.asJsoup()
         val filteredElements = document.select("a")
-            .filter { 
-                val text = it.text()
-                text.isNotBlank() && text != "../" && text != ".." && text.endsWith("/") 
-            }
+            .filter { isValidElement(it) && it.text().endsWith("/") }
             .filter { it.text().lowercase(Locale.ROOT).contains(query) }
 
         val startIndex = (currentPage - 1) * itemsPerPage
@@ -274,17 +292,18 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         }
 
         val pagedElements = filteredElements.subList(startIndex, endIndex)
+        val baseUrlObj = baseUrl.toHttpUrl()
+
         val mangas = pagedElements.map { element ->
             SManga.create().apply {
-                val folderName = element.text()
-                val cleanName = folderName.removeSuffix("/")
+                val cleanName = element.text().removeSuffix("/")
                 title = cleanName
                 
-                val encodedFolder = URLEncoder.encode(cleanName, "UTF-8").replace("+", "%20")
-                url = "/$encodedFolder/"
+                val mangaUrlObj = baseUrlObj.newBuilder().addPathSegment(cleanName).addPathSegment("").build()
+                url = mangaUrlObj.encodedPath
                 
-                val cleanBaseUrl = baseUrl.removeSuffix("/")
-                thumbnail_url = "$cleanBaseUrl/$encodedFolder/${defaultCoverName.trim()}"
+                val coverUrlObj = baseUrlObj.newBuilder().addPathSegment(cleanName).addPathSegment(defaultCoverName.trim()).build()
+                thumbnail_url = coverUrlObj.toString()
             }
         }
 
@@ -295,14 +314,14 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     // ─── Manga Details ───────────────────────────────────────────────────────
 
     override fun mangaDetailsParse(document: Document): SManga {
-        val currentUrl = document.baseUri()
+        val currentUrlObj = document.baseUri().toHttpUrlOrNull() ?: baseUrl.toHttpUrl()
+        
         val links = document.select("a")
         val imageLinks = links.filter { 
             val text = it.text().lowercase(Locale.ROOT)
-            text.isNotBlank() && text != "../" && text != ".." && 
-            (text.endsWith(".jpg") || text.endsWith(".jpeg") || 
-             text.endsWith(".png") || text.endsWith(".webp") || 
-             text.endsWith(".avif") || text.endsWith(".gif") || 
+            isValidElement(it) && 
+            (text.endsWith(".jpg") || text.endsWith(".jpeg") || text.endsWith(".png") || 
+             text.endsWith(".webp") || text.endsWith(".avif") || text.endsWith(".gif") || 
              text.endsWith(".heic") || text.endsWith(".jxl"))
         }
 
@@ -315,13 +334,12 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             description = "Folder manga lokal dari Server LocalStream (WebDAV/HTTP)."
             status = SManga.UNKNOWN
             if (coverElement != null) {
-                val encodedCover = URLEncoder.encode(coverElement.text(), "UTF-8").replace("+", "%20")
-                thumbnail_url = "${currentUrl.removeSuffix("/")}/$encodedCover"
+                thumbnail_url = currentUrlObj.newBuilder().addPathSegment(coverElement.text()).build().toString()
             }
             initialized = true
         }
 
-        val comicInfoXml = getComicInfoXml(document, currentUrl)
+        val comicInfoXml = getComicInfoXml(document, currentUrlObj)
         if (comicInfoXml.isNotBlank()) {
             parseComicInfo(comicInfoXml, manga)
         }
@@ -335,12 +353,12 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
-        val currentPath = response.request.url.encodedPath 
+        val currentUrlObj = response.request.url
         
         val chapterElements = document.select("a")
             .filter { element ->
                 val text = element.text()
-                text.isNotBlank() && text != "../" && text != ".." && 
+                isValidElement(element) && 
                 (text.endsWith("/") || text.endsWith(".cbz", true) || text.endsWith(".zip", true))
             }
 
@@ -355,10 +373,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                 val cleanName = itemName.removeSuffix("/")
                 name = cleanName
                 
-                val encodedItem = URLEncoder.encode(cleanName, "UTF-8").replace("+", "%20")
-                val suffix = if (itemName.endsWith("/")) "/" else ""
+                val builder = currentUrlObj.newBuilder().addPathSegment(cleanName)
+                if (itemName.endsWith("/")) builder.addPathSegment("")
                 
-                url = "${currentPath.removeSuffix("/")}/$encodedItem$suffix"
+                url = builder.build().encodedPath
                 chapter_number = (index + 1).toFloat()
             }
         }.reversed() 
@@ -370,12 +388,12 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
-        val currentUrl = response.request.url.toString()
+        val currentUrlObj = response.request.url
         
         val pageElements = document.select("a")
             .filter { element ->
                 val text = element.text().lowercase(Locale.ROOT)
-                text.isNotBlank() && text != "../" && text != ".." && 
+                isValidElement(element) && 
                 (text.endsWith(".jpg") || text.endsWith(".png") || text.endsWith(".jpeg") || 
                  text.endsWith(".webp") || text.endsWith(".avif") || text.endsWith(".gif") || 
                  text.endsWith(".heic") || text.endsWith(".jxl") || text.endsWith(".bmp"))
@@ -387,11 +405,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         }
 
         return sortedPages.mapIndexed { index, element ->
-            val itemName = element.text()
-            val encodedItem = URLEncoder.encode(itemName, "UTF-8").replace("+", "%20")
-            
-            val validUrl = "${currentUrl.removeSuffix("/")}/$encodedItem"
-            Page(index, "", validUrl)
+            val pageUrl = currentUrlObj.newBuilder().addPathSegment(element.text()).build().toString()
+            Page(index, "", pageUrl)
         }
     }
 
