@@ -13,6 +13,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -37,6 +38,37 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     private val defaultCoverName: String
         get() = preferences.getString(COVER_NAME_PREF, "cover.jpg") ?: "cover.jpg"
 
+    // ─── FIX: Dynamic Cover Fallback Interceptor ─────────────────────────────
+    override val client: OkHttpClient = network.client.newBuilder()
+        .addInterceptor { chain ->
+            val originalRequest = chain.request()
+            var response = chain.proceed(originalRequest)
+            
+            val urlString = originalRequest.url.toString()
+            val coverBase = defaultCoverName.substringBeforeLast(".").trim()
+            
+            // Jika request gambar cover menghasilkan 404, cari ekstensi alternatif di latar belakang
+            if (response.code == 404 && urlString.contains("/$coverBase.", ignoreCase = true)) {
+                val extensions = listOf("jpg", "jpeg", "png", "webp", "avif", "gif")
+                val currentExt = urlString.substringAfterLast(".").lowercase(Locale.ROOT)
+                
+                for (ext in extensions) {
+                    if (ext == currentExt) continue
+                    response.close() // Tutup response 404 sebelumnya
+                    
+                    val newUrl = urlString.substringBeforeLast(".") + "." + ext
+                    val newRequest = originalRequest.newBuilder().url(newUrl).build()
+                    response = chain.proceed(newRequest)
+                    
+                    if (response.isSuccessful) {
+                        break // Berhenti jika gambar dengan format ini sukses dimuat
+                    }
+                }
+            }
+            response
+        }
+        .build()
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val baseUrlPref = EditTextPreference(screen.context).apply {
             key = BASE_URL_PREF
@@ -49,7 +81,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val coverNamePref = EditTextPreference(screen.context).apply {
             key = COVER_NAME_PREF
             title = "Nama File Cover Default"
-            summary = "Harus SAMA PERSIS dengan nama file di dalam folder (case-sensitive)."
+            summary = "Nama dasar cover (Contoh: cover.jpg). Jika format berbeda (.png/.webp), sistem otomatis mendeteksinya."
             setDefaultValue("cover.jpg")
         }
         screen.addPreference(coverNamePref)
@@ -81,14 +113,11 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     private fun getComicInfoXml(document: Document): String {
         val links = document.select("a[href]")
-        
-        // Strategi 1: Cari langsung di dalam folder utama manga
         val comicInfoLink = links.find { it.attr("href").lowercase(Locale.ROOT).endsWith("comicinfo.xml") }
         if (comicInfoLink != null) {
             return downloadUrlContent(comicInfoLink.absUrl("href"))
         }
 
-        // Strategi 2: Jika tidak ketemu, coba intip ke dalam subfolder pertama (misal folder chapter)
         val subFolder = links.find { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
         if (subFolder != null) {
             try {
@@ -275,7 +304,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             initialized = true
         }
 
-        // Ambil dan pasang metadata dari ComicInfo.xml jika tersedia
         val comicInfoXml = getComicInfoXml(document)
         if (comicInfoXml.isNotBlank()) {
             parseComicInfo(comicInfoXml, manga)
@@ -346,7 +374,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         }
     }
 
-    // ─── Abstract Methods ────────────────────────────────────────────────────
     override fun popularMangaSelector(): String = ""
     override fun popularMangaFromElement(element: Element): SManga = SManga.create()
     override fun popularMangaNextPageSelector(): String? = null
