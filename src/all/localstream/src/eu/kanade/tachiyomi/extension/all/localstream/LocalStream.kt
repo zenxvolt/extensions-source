@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.extension.all.localstream
 
 import android.app.Application
 import android.content.SharedPreferences
+import android.net.Uri
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
@@ -38,7 +39,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     private val defaultCoverName: String
         get() = preferences.getString(COVER_NAME_PREF, "cover.jpg") ?: "cover.jpg"
 
-    // ─── FIX: Dynamic Cover Fallback Interceptor ─────────────────────────────
+    // ─── Interceptor: Cover Fallback ─────────────────────────────────────────
     override val client: OkHttpClient = network.client.newBuilder()
         .addInterceptor { chain ->
             val originalRequest = chain.request()
@@ -47,21 +48,20 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             val urlString = originalRequest.url.toString()
             val coverBase = defaultCoverName.substringBeforeLast(".").trim()
             
-            // Jika request gambar cover menghasilkan 404, cari ekstensi alternatif di latar belakang
             if (response.code == 404 && urlString.contains("/$coverBase.", ignoreCase = true)) {
                 val extensions = listOf("jpg", "jpeg", "png", "webp", "avif", "gif")
                 val currentExt = urlString.substringAfterLast(".").lowercase(Locale.ROOT)
                 
                 for (ext in extensions) {
                     if (ext == currentExt) continue
-                    response.close() // Tutup response 404 sebelumnya
+                    response.close()
                     
                     val newUrl = urlString.substringBeforeLast(".") + "." + ext
                     val newRequest = originalRequest.newBuilder().url(newUrl).build()
                     response = chain.proceed(newRequest)
                     
                     if (response.isSuccessful) {
-                        break // Berhenti jika gambar dengan format ini sukses dimuat
+                        break
                     }
                 }
             }
@@ -85,6 +85,33 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             setDefaultValue("cover.jpg")
         }
         screen.addPreference(coverNamePref)
+    }
+
+    // ─── Helpers: URL Sanitizer (Uri Encode) ─────────────────────────────────
+
+    /**
+     * Mengamankan URL menggunakan standard Android Uri.encode (RFC 3986).
+     * Semua spasi menjadi %20, kurung siku menjadi %5B / %5D, dll.
+     * Karakter / dan : dikecualikan agar struktur URL tidak rusak.
+     */
+    private fun getSafeAbsoluteUrl(element: Element): String {
+        val rawHref = element.attr("href")
+        if (rawHref.isBlank()) return ""
+
+        // 1. Decode agar tidak terjadi double-encoding (mencegah %20 menjadi %2520)
+        val decodedHref = Uri.decode(rawHref)
+        
+        // 2. Encode ulang sesuai standar URI, mengabaikan garis miring & titik dua
+        val safeHref = Uri.encode(decodedHref, "/:")
+
+        // 3. Update element agar absUrl bisa melakukan resolve relative path dengan benar
+        element.attr("href", safeHref)
+        val absUrl = element.absUrl("href")
+        
+        return if (absUrl.isNotBlank()) absUrl else {
+            val sep = if (baseUrl.endsWith("/") || safeHref.startsWith("/")) "" else "/"
+            "$baseUrl$sep$safeHref"
+        }
     }
 
     // ─── Helpers: Natural Sort ───────────────────────────────────────────────
@@ -113,19 +140,25 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     private fun getComicInfoXml(document: Document): String {
         val links = document.select("a[href]")
+        
+        // Cek ComicInfo di root folder saat ini
         val comicInfoLink = links.find { it.attr("href").lowercase(Locale.ROOT).endsWith("comicinfo.xml") }
         if (comicInfoLink != null) {
-            return downloadUrlContent(comicInfoLink.absUrl("href"))
+            // TERINTEGRASI: Aman memanggil URL ComicInfo
+            return downloadUrlContent(getSafeAbsoluteUrl(comicInfoLink))
         }
 
-        val subFolder = links.find { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
+        // Cek ComicInfo di dalam sub-folder pertama jika ada
+        val subFolder = links.find { it.attr("href") != "../" && it.attr("href") != ".." && it.attr("href").endsWith("/") }
         if (subFolder != null) {
             try {
-                val fixedSubUrl = subFolder.absUrl("href").replace("+", "%2B").replace(" ", "%20")
+                // TERINTEGRASI: Masuk ke subfolder dengan aman
+                val fixedSubUrl = getSafeAbsoluteUrl(subFolder)
                 val subDoc = client.newCall(GET(fixedSubUrl, headers)).execute().asJsoup()
                 val subComicInfoLink = subDoc.select("a[href]").find { it.attr("href").lowercase(Locale.ROOT).endsWith("comicinfo.xml") }
                 if (subComicInfoLink != null) {
-                    return downloadUrlContent(subComicInfoLink.absUrl("href"))
+                    // TERINTEGRASI: Mengunduh dari subfolder dengan aman
+                    return downloadUrlContent(getSafeAbsoluteUrl(subComicInfoLink))
                 }
             } catch (e: Exception) { }
         }
@@ -134,8 +167,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     private fun downloadUrlContent(url: String): String {
         return try {
-            val fixedUrl = url.replace("+", "%2B").replace(" ", "%20")
-            client.newCall(GET(fixedUrl, headers)).execute().body?.string() ?: ""
+            client.newCall(GET(url, headers)).execute().body?.string() ?: ""
         } catch (e: Exception) { "" }
     }
 
@@ -163,12 +195,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val genre = extractXmlTag(xml, "Genre")
         val categories = extractXmlTag(xml, "Categories")
 
-        if (!series.isNullOrBlank()) {
-            manga.title = series
-        }
-        if (!summary.isNullOrBlank()) {
-            manga.description = summary
-        }
+        if (!series.isNullOrBlank()) { manga.title = series }
+        if (!summary.isNullOrBlank()) { manga.description = summary }
 
         val authorsList = listOfNotNull(writer, penciller, publisher).distinct()
         manga.author = authorsList.joinToString(" | ").takeIf { it.isNotBlank() } ?: "Unknown"
@@ -204,7 +232,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
         val document = response.asJsoup()
         val allElements = document.select("a[href]")
-            .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
+            .filter { it.attr("href") != "../" && it.attr("href") != ".." && it.attr("href").endsWith("/") }
 
         val startIndex = (currentPage - 1) * itemsPerPage
         val endIndex = minOf(startIndex + itemsPerPage, allElements.size)
@@ -217,13 +245,14 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val mangas = pagedElements.map { element ->
             SManga.create().apply {
                 title = element.text().removeSuffix("/")
-                val absUrl = element.absUrl("href")
-                val fixedAbsUrl = absUrl.replace("+", "%2B").replace(" ", "%20")
                 
+                // TERINTEGRASI: Relatif URL (untuk query manga) aman
+                val fixedAbsUrl = getSafeAbsoluteUrl(element)
                 var relUrl = fixedAbsUrl.removePrefix(baseUrl)
                 if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                 url = relUrl
                 
+                // TERINTEGRASI: Thumbnail Manga list aman
                 val cleanAbsUrl = fixedAbsUrl.removeSuffix("/")
                 thumbnail_url = "$cleanAbsUrl/${defaultCoverName.trim()}"
             }
@@ -247,7 +276,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
         val document = response.asJsoup()
         val filteredElements = document.select("a[href]")
-            .filter { !it.attr("href").contains("..") && it.attr("href").endsWith("/") }
+            .filter { it.attr("href") != "../" && it.attr("href") != ".." && it.attr("href").endsWith("/") }
             .filter { it.text().lowercase(Locale.ROOT).contains(query) }
 
         val startIndex = (currentPage - 1) * itemsPerPage
@@ -261,9 +290,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val mangas = pagedElements.map { element ->
             SManga.create().apply {
                 title = element.text().removeSuffix("/")
-                val absUrl = element.absUrl("href")
-                val fixedAbsUrl = absUrl.replace("+", "%2B").replace(" ", "%20")
                 
+                val fixedAbsUrl = getSafeAbsoluteUrl(element)
                 var relUrl = fixedAbsUrl.removePrefix(baseUrl)
                 if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                 url = relUrl
@@ -283,7 +311,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val links = document.select("a[href]")
         val imageLinks = links.filter { 
             val href = it.attr("href").lowercase(Locale.ROOT)
-            !href.contains("..") && (href.endsWith(".jpg") || href.endsWith(".jpeg") || 
+            href != "../" && href != ".." && (href.endsWith(".jpg") || href.endsWith(".jpeg") || 
                                      href.endsWith(".png") || href.endsWith(".webp") || 
                                      href.endsWith(".avif") || href.endsWith(".gif") || 
                                      href.endsWith(".heic") || href.endsWith(".jxl"))
@@ -298,12 +326,13 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             description = "Folder manga lokal dari Server LocalStream (WebDAV/HTTP)."
             status = SManga.UNKNOWN
             if (coverElement != null) {
-                val absUrl = coverElement.absUrl("href")
-                thumbnail_url = absUrl.replace("+", "%2B").replace(" ", "%20")
+                // TERINTEGRASI: Cover di menu Details Manga aman
+                thumbnail_url = getSafeAbsoluteUrl(coverElement)
             }
             initialized = true
         }
 
+        // Memanggil fungsi parser ComicInfo yang sudah terintegrasi
         val comicInfoXml = getComicInfoXml(document)
         if (comicInfoXml.isNotBlank()) {
             parseComicInfo(comicInfoXml, manga)
@@ -322,9 +351,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val chapterElements = document.select("a[href]")
             .filter { element ->
                 val href = element.attr("href").lowercase(Locale.ROOT)
-                !href.contains("..") && (href.endsWith("/") || href.endsWith(".cbz") || href.endsWith(".zip"))
+                href != "../" && href != ".." && (href.endsWith("/") || href.endsWith(".cbz") || href.endsWith(".zip"))
             }
 
+        // Sorting tetap menggunakan teks asli (sebelum di-encode) agar akurat
         val comparator = naturalSortComparator()
         val sortedElements = chapterElements.sortedWith { a, b -> 
             comparator.compare(a.text(), b.text()) 
@@ -333,9 +363,9 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         return sortedElements.mapIndexed { index, element ->
                 SChapter.create().apply {
                     name = element.text().removeSuffix("/")
-                    val absUrl = element.absUrl("href")
                     
-                    val fixedAbsUrl = absUrl.replace("+", "%2B").replace(" ", "%20")
+                    // TERINTEGRASI: URL Chapter aman
+                    val fixedAbsUrl = getSafeAbsoluteUrl(element)
                     var relUrl = fixedAbsUrl.removePrefix(baseUrl)
                     if (!relUrl.startsWith("/")) relUrl = "/$relUrl"
                     url = relUrl
@@ -359,7 +389,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                               href.endsWith(".avif") || href.endsWith(".gif") || 
                               href.endsWith(".heic") || href.endsWith(".jxl") || 
                               href.endsWith(".bmp")
-                !href.contains("..") && isImage
+                href != "../" && href != ".." && isImage
             }
 
         val comparator = naturalSortComparator()
@@ -368,12 +398,13 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         }
 
         return sortedPages.mapIndexed { index, element ->
-            val absUrl = element.absUrl("href")
-            val validUrl = absUrl.replace("+", "%2B").replace(" ", "%20")
+            // TERINTEGRASI: Load setiap Image/Halaman aman
+            val validUrl = getSafeAbsoluteUrl(element)
             Page(index, "", validUrl)
         }
     }
 
+    // ─── Unused / Overrides ──────────────────────────────────────────────────
     override fun popularMangaSelector(): String = ""
     override fun popularMangaFromElement(element: Element): SManga = SManga.create()
     override fun popularMangaNextPageSelector(): String? = null
