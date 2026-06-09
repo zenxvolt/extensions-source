@@ -88,6 +88,23 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         screen.addPreference(coverNamePref)
     }
 
+    // ─── Helpers: Text Cleaner (Pembersih &amp;) ─────────────────────────────
+    
+    /**
+     * Membersihkan nama dari kode HTML (seperti &amp;) yang dihasilkan server
+     * dan menghapus garis miring di akhir judul.
+     */
+    private fun String.cleanTitle(): String {
+        return this.trim()
+            .removeSuffix("/")
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+    }
+
     // ─── Helpers: URL Sanitizer ──────────────────────────────────────────────
 
     private fun getSafeAbsoluteUrl(element: Element): String {
@@ -106,24 +123,18 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         }
     }
 
-    // ─── FIX: Hierarchy Validation (Pencegah Breadcrumb & Folder Kosong) ────
+    // ─── Hierarchy Validation (Pencegah Breadcrumb & Folder Kosong) ──────────
 
-    /**
-     * Memastikan link yang diproses benar-benar anak direktori (file/folder valid)
-     * dan BUKAN navigasi mundur (seperti "Xniyomi" atau "local") atau icon root kosong.
-     */
     private fun getValidChildElements(
         document: Document, 
         requireText: Boolean = true, 
         condition: ((String) -> Boolean)? = null
     ): List<Element> {
-        // Ambil URL folder yang sedang diakses saat ini
         val baseUri = document.baseUri().substringBefore("#").substringBefore("?")
         val decodedBaseUri = Uri.decode(baseUri)
         val parentPath = if (decodedBaseUri.endsWith("/")) decodedBaseUri else "$decodedBaseUri/"
 
         return document.select("a[href]").filter { element ->
-            // 1. Buang elemen jika teks kosong (mencegah chapter/manga tanpa nama)
             if (requireText && element.text().trim().isEmpty()) return@filter false
             
             val absUrl = getSafeAbsoluteUrl(element)
@@ -132,12 +143,9 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             val cleanAbsUrl = absUrl.substringBefore("#").substringBefore("?")
             val decodedAbsUrl = Uri.decode(cleanAbsUrl)
             
-            // 2. Strict Check: URL tujuan HARUS berada di dalam folder saat ini (Child Node).
-            // Ini akan otomatis membuang breadcrumb seperti "/Xniyomi/" karena hirarkinya lebih tinggi.
             val isChild = decodedAbsUrl.startsWith(parentPath, ignoreCase = true) && decodedAbsUrl.length > parentPath.length
             if (!isChild) return@filter false
             
-            // 3. Terapkan filter tambahan (seperti .jpg, .cbz, dsb)
             condition?.invoke(decodedAbsUrl.lowercase(Locale.ROOT)) ?: true
         }
     }
@@ -208,12 +216,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     private fun parseComicInfo(xml: String, manga: SManga) {
         val series = extractXmlTag(xml, "Series")
-        val summary = extractXmlTag(xml, "Summary")
-            ?.replace("&amp;", "&")
-            ?.replace("&lt;", "<")
-            ?.replace("&gt;", ">")
-            ?.replace("&quot;", "\"")
-            ?.replace("&apos;", "'")
+        val summary = extractXmlTag(xml, "Summary")?.cleanTitle()
 
         val writer = extractXmlTag(xml, "Writer")
         val penciller = extractXmlTag(xml, "Penciller")
@@ -222,8 +225,12 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val genre = extractXmlTag(xml, "Genre")
         val categories = extractXmlTag(xml, "Categories")
 
-        if (!series.isNullOrBlank()) { manga.title = series }
-        if (!summary.isNullOrBlank()) { manga.description = summary }
+        if (!series.isNullOrBlank()) { 
+            manga.title = series.cleanTitle() 
+        }
+        if (!summary.isNullOrBlank()) { 
+            manga.description = summary 
+        }
 
         val authorsList = listOfNotNull(writer, penciller, publisher).distinct()
         manga.author = authorsList.joinToString(" | ").takeIf { it.isNotBlank() } ?: "Unknown"
@@ -270,7 +277,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val pagedElements = allElements.subList(startIndex, endIndex)
         val mangas = pagedElements.map { element ->
             SManga.create().apply {
-                title = element.text().trim().removeSuffix("/")
+                title = element.text().cleanTitle()
                 
                 val fixedAbsUrl = getSafeAbsoluteUrl(element)
                 val relPath = fixedAbsUrl.removePrefix(baseUrl)
@@ -299,7 +306,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
         val document = response.asJsoup()
         val filteredElements = getValidChildElements(document) { it.endsWith("/") }
-            .filter { it.text().lowercase(Locale.ROOT).contains(query) }
+            .filter { it.text().cleanTitle().lowercase(Locale.ROOT).contains(query) }
 
         val startIndex = (currentPage - 1) * itemsPerPage
         val endIndex = minOf(startIndex + itemsPerPage, filteredElements.size)
@@ -311,7 +318,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val pagedElements = filteredElements.subList(startIndex, endIndex)
         val mangas = pagedElements.map { element ->
             SManga.create().apply {
-                title = element.text().trim().removeSuffix("/")
+                title = element.text().cleanTitle()
                 
                 val fixedAbsUrl = getSafeAbsoluteUrl(element)
                 val relPath = fixedAbsUrl.removePrefix(baseUrl)
@@ -373,7 +380,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
         return sortedElements.mapIndexed { index, element ->
                 SChapter.create().apply {
-                    name = element.text().trim().removeSuffix("/")
+                    name = element.text().cleanTitle()
                     
                     val fixedAbsUrl = getSafeAbsoluteUrl(element)
                     val relPath = fixedAbsUrl.removePrefix(baseUrl)
