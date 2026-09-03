@@ -3,7 +3,6 @@ package eu.kanade.tachiyomi.extension.all.localstream
 import android.app.Application
 import android.content.SharedPreferences
 import android.net.Uri
-import android.util.LruCache
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
@@ -15,20 +14,16 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import okhttp3.Cache
-import okhttp3.CacheControl
-import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import okhttp3.logging.HttpLoggingInterceptor
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import org.jsoup.select.Elements
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
-import java.io.File
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 class LocalStream : ParsedHttpSource(), ConfigurableSource {
@@ -41,346 +36,327 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
     }
 
-    // ─── Caches ──────────────────────────────────────────────────────────────
-    
-    /** Cache metadata manga agar tidak fetch ComicInfo.xml berulang kali */
-    private val mangaMetaCache = LruCache<String, MangaMeta>(50)
-    
-    /** Cache hasil parsing elemen valid per URL */
-    private val elementCache = LruCache<String, List<Element>>(100)
-    
-    /** Cache daftar chapter per manga URL */
-    private val chapterCache = LruCache<String, List<SChapter>>(50)
-
-    // ─── Precompiled Regex & Constants ───────────────────────────────────────
-    
-    private val htmlEntityRegex = Regex("&(amp|quot|apos|#39|lt|gt);")
-    private val tokenizeRegex = Regex("(\\d+|\\D+)")
-    private val comicInfoTagRegex = Regex(
-        "<(?:\\w+:)?(Series|Summary|Writer|Penciller|Publisher|PublishingStatusTachiyomi|Status|Genre|Categories)(?:\\s+[^>]*)?>(.*?)</(?:\\w+:)?\\1>",
-        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-    )
-    private val imageExtensions = listOf(".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".heic", ".jxl", ".bmp")
-    private val coverExtensions = listOf("jpg", "jpeg", "png", "webp", "avif", "gif")
-    
-    private val htmlEntityMap = mapOf(
-        "amp" to "&",
-        "quot" to "\"",
-        "apos" to "'",
-        "#39" to "'",
-        "lt" to "<",
-        "gt" to ">"
-    )
-
-    // ─── Optimized OkHttpClient ──────────────────────────────────────────────
-    
-    override val client: OkHttpClient by lazy {
-        val cacheDir = File(Injekt.get<Application>().cacheDir, "localstream_cache")
-        val cacheSize = 50L * 1024 * 1024 // 50 MB
-        
-        network.client.newBuilder()
-            .cache(Cache(cacheDir, cacheSize))
-            .connectionPool(ConnectionPool(10, 2, TimeUnit.MINUTES))
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .readTimeout(10, TimeUnit.SECONDS)
-            .writeTimeout(5, TimeUnit.SECONDS)
-            .addInterceptor { chain ->
-                val request = chain.request()
-                // Gunakan cache untuk request GET biasa
-                val newRequest = if (request.method == "GET") {
-                    request.newBuilder()
-                        .cacheControl(CacheControl.Builder().maxStale(1, TimeUnit.HOURS).build())
-                        .build()
-                } else request
-                chain.proceed(newRequest)
-            }
-            .addInterceptor { chain ->
-                val originalRequest = chain.request()
-                val urlString = originalRequest.url.toString()
-                
-                // Fast path: bukan request cover
-                val coverBase = defaultCoverName.substringBeforeLast(".")
-                if (!urlString.contains("/$coverBase.", ignoreCase = true)) {
-                    return@addInterceptor chain.proceed(originalRequest)
-                }
-                
-                var response = chain.proceed(originalRequest)
-                if (response.isSuccessful) return@addInterceptor response
-                
-                // Cover fallback dengan HEAD request (lebih ringan)
-                if (response.code == 404) {
-                    val currentExt = urlString.substringAfterLast(".").lowercase(Locale.ROOT)
-                    val baseUrlNoExt = urlString.substringBeforeLast(".")
-                    
-                    for (ext in coverExtensions) {
-                        if (ext == currentExt) continue
-                        response.close()
-                        
-                        val headUrl = "$baseUrlNoExt.$ext"
-                        val headRequest = originalRequest.newBuilder()
-                            .url(headUrl)
-                            .head()
-                            .build()
-                        
-                        val headResponse = chain.proceed(headRequest)
-                        if (headResponse.isSuccessful) {
-                            headResponse.close()
-                            // Baru fetch dengan GET
-                            val getRequest = originalRequest.newBuilder().url(headUrl).build()
-                            return@addInterceptor chain.proceed(getRequest)
-                        }
-                        headResponse.close()
-                    }
-                }
-                response
-            }
-            .build()
-    }
-
-    // ─── Preferences ─────────────────────────────────────────────────────────
-    
+    // Pastikan base URL selalu BERSIH tanpa trailing slash ganda
     override val baseUrl: String
         get() = preferences.getString(BASE_URL_PREF, "http://127.0.0.1:8080")?.trimEnd('/') ?: "http://127.0.0.1:8080"
 
     private val defaultCoverName: String
-        get() = preferences.getString(COVER_NAME_PREF, "cover.jpg") ?: "cover.jpg"
+        get() = preferences.getString(COVER_NAME_PREF, "cover.jpg")?.trim() ?: "cover.jpg"
+
+    // ─── Client: disetel untuk server lokal/LAN yang cepat ───────────────────
+    // - Timeout dipersingkat karena server biasanya ada di localhost/LAN, jadi
+    //   kalau server mati sebaiknya gagal cepat, bukan menggantung lama.
+    // - maxRequestsPerHost dinaikkan: SEMUA request menuju host yang sama
+    //   (server lokal), padahal default OkHttp cuma izinkan 5 request paralel
+    //   per host. Itu bikin grid cover (mis. 24 thumbnail sekaligus) antre
+    //   dan terasa lambat padahal servernya lokal & sanggup lebih cepat.
+    override val client: OkHttpClient = network.client.newBuilder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
+        .dispatcher(
+            Dispatcher().apply {
+                maxRequests = 64
+                maxRequestsPerHost = 32
+            },
+        )
+        .addInterceptor { chain ->
+            val originalRequest = chain.request()
+            var response = chain.proceed(originalRequest)
+
+            val urlString = originalRequest.url.toString()
+            val coverBase = defaultCoverName.substringBeforeLast(".").trim()
+
+            if (response.code == 404 && urlString.contains("/$coverBase.", ignoreCase = true)) {
+                val currentExtOriginal = urlString.substringAfterLast(".").lowercase(Locale.ROOT)
+                for (ext in COVER_FALLBACK_EXTENSIONS) {
+                    if (ext == currentExtOriginal) continue
+                    response.close()
+
+                    val newUrl = urlString.substringBeforeLast(".") + "." + ext
+                    val newRequest = originalRequest.newBuilder().url(newUrl).build()
+                    response = chain.proceed(newRequest)
+
+                    if (response.isSuccessful) break
+                }
+            }
+            response
+        }
+        .build()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        screen.addPreference(EditTextPreference(screen.context).apply {
+        val baseUrlPref = EditTextPreference(screen.context).apply {
             key = BASE_URL_PREF
             title = "Server URL (Round Sync / Termux)"
             summary = "Masukkan URL lokal dari Rclone Serve."
             setDefaultValue("http://127.0.0.1:8080")
-        })
-        screen.addPreference(EditTextPreference(screen.context).apply {
+        }
+        screen.addPreference(baseUrlPref)
+
+        val coverNamePref = EditTextPreference(screen.context).apply {
             key = COVER_NAME_PREF
             title = "Nama File Cover Default"
             summary = "Nama dasar cover (Contoh: cover.jpg)."
             setDefaultValue("cover.jpg")
-        })
-    }
-
-    // ─── Fast String Cleaner ─────────────────────────────────────────────────
-    
-    private fun String.cleanTitle(): String {
-        var result = this.trim().removeSuffix("/")
-        // Replace HTML entities menggunakan precompiled regex
-        result = htmlEntityRegex.replace(result) { match ->
-            htmlEntityMap[match.groupValues[1]] ?: match.value
         }
-        return result
+        screen.addPreference(coverNamePref)
     }
 
-    // ─── Optimized URL Helper ────────────────────────────────────────────────
-    
-    private fun getSafeAbsoluteUrl(element: Element, base: String = baseUrl): String {
+    // ─── Cache ringan untuk listing direktori & ComicInfo.xml ────────────────
+    // Kenapa perlu: Mihon sering memanggil ulang popular/search/chapter list
+    // untuk URL yang PERSIS SAMA (mis. ganti halaman hanya mengubah #fragment,
+    // bukan URL asli yang dikirim ke server; buka detail manga lalu kembali;
+    // refresh library). Tanpa cache, semua itu memicu request+parse HTML dari
+    // nol setiap kali. TTL pendek (1 menit) menjaga data tetap relevan tapi
+    // menghapus kerja berulang yang sia-sia.
+    private data class CachedDoc(val document: Document, val fetchedAt: Long)
+    private val documentCache = ConcurrentHashMap<String, CachedDoc>()
+
+    private data class CachedComicInfo(val xml: String, val fetchedAt: Long)
+    private val comicInfoCache = ConcurrentHashMap<String, CachedComicInfo>()
+
+    private fun isFresh(fetchedAt: Long): Boolean =
+        System.currentTimeMillis() - fetchedAt < CACHE_TTL_MS
+
+    /** Dipakai saat kita BELUM punya Response siap pakai (mis. cek subfolder ComicInfo.xml). */
+    private fun fetchDocument(url: String): Document {
+        documentCache[url]?.let { cached -> if (isFresh(cached.fetchedAt)) return cached.document }
+        val document = client.newCall(GET(url, headers)).execute().asJsoup()
+        documentCache[url] = CachedDoc(document, System.currentTimeMillis())
+        return document
+    }
+
+    /**
+     * Dipakai saat framework SUDAH mengeksekusi network call dan memberi kita Response
+     * (popularMangaParse/searchMangaParse/chapterListParse/pageListParse). Kalau cache
+     * masih segar, kita buang response yang baru (tutup koneksinya) dan pakai hasil parse
+     * lama supaya tidak membangun ulang DOM tree dari HTML yang identik.
+     */
+    private fun resolveDocument(response: Response): Document {
+        val key = response.request.url.toString().substringBefore("#")
+        documentCache[key]?.let { cached ->
+            if (isFresh(cached.fetchedAt)) {
+                response.close()
+                return cached.document
+            }
+        }
+        val document = response.asJsoup()
+        documentCache[key] = CachedDoc(document, System.currentTimeMillis())
+        return document
+    }
+
+    // ─── Helpers: Text Cleaner (Pembersih &amp;) ─────────────────────────────
+
+    /**
+     * Membersihkan nama dari kode HTML (seperti &amp;) yang dihasilkan server
+     * dan menghapus garis miring di akhir judul.
+     */
+    private fun String.cleanTitle(): String {
+        val trimmed = this.trim().removeSuffix("/")
+        // Fast path: kalau tidak ada "&" sama sekali, tidak perlu 6x replace().
+        if (trimmed.indexOf('&') == -1) return trimmed
+        return trimmed
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+    }
+
+    // ─── Helpers: URL Sanitizer ──────────────────────────────────────────────
+
+    private fun getSafeAbsoluteUrl(element: Element): String {
         val rawHref = element.attr("href")
         if (rawHref.isBlank()) return ""
-        
-        val safeHref = Uri.encode(Uri.decode(rawHref), "/:")
+
+        val decodedHref = Uri.decode(rawHref)
+        val safeHref = Uri.encode(decodedHref, "/:")
+
         element.attr("href", safeHref)
-        
         val absUrl = element.absUrl("href")
+
         return if (absUrl.isNotBlank()) absUrl else {
-            val sep = if (base.endsWith("/") || safeHref.startsWith("/")) "" else "/"
-            "$base$sep$safeHref"
+            val sep = if (baseUrl.endsWith("/") || safeHref.startsWith("/")) "" else "/"
+            "$baseUrl$sep$safeHref"
         }
     }
 
-    // ─── Optimized Hierarchy Validation ──────────────────────────────────────
-    
-    private fun getValidChildElements(
+    // ─── Hierarchy Validation (Pencegah Breadcrumb & Folder Kosong) ──────────
+    // LinkEntry menyimpan absUrl yang SUDAH dihitung sekali. Sebelumnya
+    // getSafeAbsoluteUrl(element) dipanggil sekali untuk memfilter, lalu
+    // dipanggil LAGI di pemanggil (popularMangaParse, chapterListParse, dst)
+    // untuk membangun hasil akhir — dua kali kerja Uri.decode/encode per
+    // elemen. Untuk folder berisi ratusan entri, itu langsung dua kali lipat
+    // biaya parsing tanpa manfaat. Sekarang dihitung sekali dan dipakai ulang.
+    private data class LinkEntry(val element: Element, val text: String, val absUrl: String)
+
+    private fun getValidLinkEntries(
         document: Document,
         requireText: Boolean = true,
-        condition: ((String) -> Boolean)? = null
-    ): List<Element> {
-        val cacheKey = "${document.baseUri()}|${requireText}|${condition != null}"
-        elementCache.get(cacheKey)?.let { return it }
-        
+        condition: ((String) -> Boolean)? = null,
+    ): List<LinkEntry> {
         val baseUri = document.baseUri().substringBefore("#").substringBefore("?")
         val decodedBaseUri = Uri.decode(baseUri)
         val parentPath = if (decodedBaseUri.endsWith("/")) decodedBaseUri else "$decodedBaseUri/"
-        
-        val allLinks = document.select("a[href]")
-        val result = ArrayList<Element>(allLinks.size)
-        
-        for (element in allLinks) {
-            if (requireText && element.text().trim().isEmpty()) continue
-            
-            val absUrl = getSafeAbsoluteUrl(element, baseUri)
+
+        val entries = ArrayList<LinkEntry>()
+        for (element in document.select("a[href]")) {
+            val text = element.text().trim()
+            if (requireText && text.isEmpty()) continue
+
+            val absUrl = getSafeAbsoluteUrl(element)
             if (absUrl.isBlank()) continue
-            
+
             val cleanAbsUrl = absUrl.substringBefore("#").substringBefore("?")
             val decodedAbsUrl = Uri.decode(cleanAbsUrl)
-            
-            if (!decodedAbsUrl.startsWith(parentPath, ignoreCase = true)) continue
-            if (decodedAbsUrl.length <= parentPath.length) continue
-            
+
+            val isChild = decodedAbsUrl.startsWith(parentPath, ignoreCase = true) && decodedAbsUrl.length > parentPath.length
+            if (!isChild) continue
+
             if (condition != null && !condition(decodedAbsUrl.lowercase(Locale.ROOT))) continue
-            
-            result.add(element)
+
+            entries.add(LinkEntry(element, text, absUrl))
         }
-        
-        val finalResult = result.toList()
-        elementCache.put(cacheKey, finalResult)
-        return finalResult
+        return entries
     }
 
-    // ─── Natural Sort (Optimized) ────────────────────────────────────────────
-    
-    private val naturalComparator = Comparator<String> { a, b ->
-        val tokensA = tokenizeRegex.findAll(a).map { it.value }.toList()
-        val tokensB = tokenizeRegex.findAll(b).map { it.value }.toList()
+    // ─── Helpers: Natural Sort (kunci sort dihitung sekali di depan) ─────────
+    // Sebelumnya sortedWith { comparator.compare(a.text(), b.text()) } memanggil
+    // tokenize() — yang menjalankan regex — pada KEDUA operand di SETIAP
+    // perbandingan, jadi total pemanggilan regex ada di kisaran O(n log n).
+    // Dengan menghitung token setiap elemen sekali di awal (Schwartzian
+    // transform), regex hanya dijalankan O(n) kali. Untuk folder dengan
+    // banyak chapter/halaman, ini yang paling terasa di responsivitas.
+    private fun tokenize(s: String): List<String> =
+        Regex("(\\d+|\\D+)").findAll(s).map { it.value }.toList()
+
+    private fun compareTokens(tokensA: List<String>, tokensB: List<String>): Int {
         val len = minOf(tokensA.size, tokensB.size)
-        
         for (i in 0 until len) {
             val ta = tokensA[i]
             val tb = tokensB[i]
-            val cmp = if (ta[0].isDigit() && tb[0].isDigit()) {
-                // Parse angka tanpa BigInteger untuk performa lebih baik
-                val na = ta.toLongOrNull() ?: 0L
-                val nb = tb.toLongOrNull() ?: 0L
-                na.compareTo(nb)
+            val cmp = if (ta.first().isDigit() && tb.first().isDigit()) {
+                ta.toBigInteger().compareTo(tb.toBigInteger())
             } else {
                 ta.lowercase().compareTo(tb.lowercase())
             }
-            if (cmp != 0) return@Comparator cmp
+            if (cmp != 0) return cmp
         }
-        tokensA.size.compareTo(tokensB.size)
+        return tokensA.size.compareTo(tokensB.size)
     }
 
-    // ─── ComicInfo Parser (Cached & Optimized) ───────────────────────────────
-    
-    private data class MangaMeta(
-        val title: String? = null,
-        val description: String? = null,
-        val author: String? = null,
-        val artist: String? = null,
-        val genre: String? = null,
-        val status: Int = SManga.UNKNOWN
-    )
-    
-    private fun getComicInfoXml(document: Document): String {
-        val baseUri = document.baseUri()
-        
-        // Coba langsung di folder ini
-        val comicInfoLink = getValidChildElements(document, requireText = false) { 
-            it.endsWith("comicinfo.xml") 
+    private fun List<LinkEntry>.naturalSorted(): List<LinkEntry> =
+        this.map { it to tokenize(it.text) }
+            .sortedWith { (_, ta), (_, tb) -> compareTokens(ta, tb) }
+            .map { it.first }
+
+    // ─── Helpers: ComicInfo Metadata Parser ──────────────────────────────────
+
+    /** Cache per-manga: membuka detail manga berulang kali tidak lagi memicu ulang 1-2 request. */
+    private fun getComicInfoXml(document: Document, cacheKey: String): String {
+        comicInfoCache[cacheKey]?.let { cached -> if (isFresh(cached.fetchedAt)) return cached.xml }
+        val xml = resolveComicInfoXml(document)
+        comicInfoCache[cacheKey] = CachedComicInfo(xml, System.currentTimeMillis())
+        return xml
+    }
+
+    private fun resolveComicInfoXml(document: Document): String {
+        val comicInfoLink = getValidLinkEntries(document, requireText = false) {
+            it.endsWith("comicinfo.xml")
         }.firstOrNull()
-        
+
         if (comicInfoLink != null) {
-            return downloadUrlContent(getSafeAbsoluteUrl(comicInfoLink, baseUri))
+            return downloadUrlContent(comicInfoLink.absUrl)
         }
-        
-        // Coba di subfolder pertama (hanya 1 level, tidak recursive)
-        val subFolder = getValidChildElements(document) { it.endsWith("/") }.firstOrNull()
+
+        val subFolder = getValidLinkEntries(document) { it.endsWith("/") }.firstOrNull()
         if (subFolder != null) {
             try {
-                val subUrl = getSafeAbsoluteUrl(subFolder, baseUri)
-                val subDoc = client.newCall(GET(subUrl, headers)).execute().use { it.asJsoup() }
-                val subComicInfo = getValidChildElements(subDoc, requireText = false) { 
-                    it.endsWith("comicinfo.xml") 
+                val subDoc = fetchDocument(subFolder.absUrl)
+                val subComicInfoLink = getValidLinkEntries(subDoc, requireText = false) {
+                    it.endsWith("comicinfo.xml")
                 }.firstOrNull()
-                
-                if (subComicInfo != null) {
-                    return downloadUrlContent(getSafeAbsoluteUrl(subComicInfo, subUrl))
+
+                if (subComicInfoLink != null) {
+                    return downloadUrlContent(subComicInfoLink.absUrl)
                 }
-            } catch (_: Exception) { }
+            } catch (e: Exception) { }
         }
         return ""
     }
-    
+
     private fun downloadUrlContent(url: String): String {
         return try {
-            client.newCall(GET(url, headers)).execute().use { response ->
-                if (response.isSuccessful) response.body?.string() ?: "" else ""
-            }
-        } catch (_: Exception) { "" }
+            client.newCall(GET(url, headers)).execute().body?.string() ?: ""
+        } catch (e: Exception) { "" }
     }
-    
-    private fun parseComicInfo(xml: String): MangaMeta {
-        val matches = comicInfoTagRegex.findAll(xml)
-        val tags = mutableMapOf<String, String>()
-        
-        for (match in matches) {
-            val tagName = match.groupValues[1].lowercase(Locale.ROOT)
-            val value = match.groupValues[2].trim()
-            if (value.isNotBlank()) tags[tagName] = value
+
+    private fun extractXmlTag(xml: String, tag: String): String? {
+        val regex = Regex(
+            "<(?:\\w+:)?$tag(?:\\s+[^>]*)?>(.*?)</(?:\\w+:)?$tag>",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
+        return regex.find(xml)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotBlank() }
+    }
+
+    private fun parseComicInfo(xml: String, manga: SManga) {
+        val series = extractXmlTag(xml, "Series")
+        val summary = extractXmlTag(xml, "Summary")?.cleanTitle()
+
+        val writer = extractXmlTag(xml, "Writer")
+        val penciller = extractXmlTag(xml, "Penciller")
+        val publisher = extractXmlTag(xml, "Publisher")
+        val statusStr = extractXmlTag(xml, "PublishingStatusTachiyomi") ?: extractXmlTag(xml, "Status")
+        val genre = extractXmlTag(xml, "Genre")
+        val categories = extractXmlTag(xml, "Categories")
+
+        if (!series.isNullOrBlank()) {
+            manga.title = series.cleanTitle()
         }
-        
-        val series = tags["series"]?.cleanTitle()
-        val summary = tags["summary"]?.cleanTitle()
-        val writer = tags["writer"]
-        val penciller = tags["penciller"]
-        val publisher = tags["publisher"]
-        val statusStr = tags["publishingstatustachiyomi"] ?: tags["status"]
-        val genre = tags["genre"]
-iyomi"] ?: tags["status"]
-        val genre = tags["genre"]
-        val categories = tags["categories"]
-        
+        if (!summary.isNullOrBlank()) {
+            manga.description = summary
+        }
+
         val authorsList = listOfNotNull(writer, penciller, publisher).distinct()
+        manga.author = authorsList.joinToString(" | ").takeIf { it.isNotBlank() } ?: "Unknown"
+        manga.artist = penciller ?: writer ?: "Unknown"
+
         val allGenres = listOfNotNull(genre, categories)
             .flatMap { it.split(",") }
             .map { it.trim() }
             .filter { it.isNotBlank() }
             .distinct()
-        
-        val status = when (statusStr?.lowercase(Locale.ROOT)) {
+
+        if (allGenres.isNotEmpty()) {
+            manga.genre = allGenres.joinToString(", ")
+        }
+
+        manga.status = when (statusStr?.lowercase(Locale.ROOT)) {
             "ongoing", "1" -> SManga.ONGOING
             "completed", "end", "2" -> SManga.COMPLETED
             "cancelled", "abandoned", "6" -> SManga.CANCELLED
             "hiatus" -> SManga.ON_HIATUS
             else -> SManga.UNKNOWN
         }
-        
-        return MangaMeta(
-            title = series,
-            description = summary,
-            author = authorsList.joinToString(" | ").takeIf { it.isNotBlank() },
-            artist = penciller ?: writer,
-            genre = allGenres.joinToString(", ").takeIf { it.isNotBlank() },
-            status = status
-        )
     }
 
-    // ─── Browse / Popular (Optimized) ────────────────────────────────────────
-    
+    // ─── Browse / Popular ────────────────────────────────────────────────────
+
     override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/#page=$page", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val currentPage = response.request.url.fragment?.substringAfter("page=")?.toIntOrNull() ?: 1
-        val itemsPerPage = 24
-        
-        val document = response.asJsoup()
-        val allElements = getValidChildElements(document) { it.endsWith("/") }
-        
-        val startIndex = (currentPage - 1) * itemsPerPage
-        if (startIndex >= allElements.size) {
-            return MangasPage(emptyList(), false)
-        }
-        
-        val endIndex = minOf(startIndex + itemsPerPage, allElements.size)
-        val pagedElements = allElements.subList(startIndex, endIndex)
-        
-        val mangas = ArrayList<SManga>(pagedElements.size)
-        for (element in pagedElements) {
-            val fixedAbsUrl = getSafeAbsoluteUrl(element)
-            val relPath = fixedAbsUrl.removePrefix(baseUrl)
-            val cleanAbsUrl = fixedAbsUrl.removeSuffix("/")
-            
-            mangas.add(SManga.create().apply {
-                title = element.text().cleanTitle()
-                url = if (relPath.startsWith("/")) relPath else "/$relPath"
-                thumbnail_url = "$cleanAbsUrl/${defaultCoverName.trim()}"
-            })
-        }
-        
-        return MangasPage(mangas, endIndex < allElements.size)
+        val fragment = response.request.url.fragment ?: ""
+        val currentPage = fragment.substringAfter("page=").toIntOrNull() ?: 1
+
+        val document = resolveDocument(response)
+        val allEntries = getValidLinkEntries(document) { it.endsWith("/") }
+
+        return buildMangasPage(allEntries, currentPage)
     }
 
-    // ─── Search (Optimized) ──────────────────────────────────────────────────
-    
+    // ─── Search ──────────────────────────────────────────────────────────────
+
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         return GET("$baseUrl/#query=${query.lowercase(Locale.ROOT)}&page=$page", headers)
     }
@@ -389,151 +365,104 @@ iyomi"] ?: tags["status"]
         val fragment = response.request.url.fragment ?: ""
         val query = fragment.substringAfter("query=").substringBefore("&page=").lowercase(Locale.ROOT)
         val currentPage = fragment.substringAfter("page=").toIntOrNull() ?: 1
-        val itemsPerPage = 24
-        
-        val document = response.asJsoup()
-        val filteredElements = getValidChildElements(document) { it.endsWith("/") }
-            .filter { it.text().cleanTitle().lowercase(Locale.ROOT).contains(query) }
-        
-        val startIndex = (currentPage - 1) * itemsPerPage
-        if (startIndex >= filteredElements.size) {
-            return MangasPage(emptyList(), false)
-        }
-        
-        val endIndex = minOf(startIndex + itemsPerPage, filteredElements.size)
-        val pagedElements = filteredElements.subList(startIndex, endIndex)
-        
-        val mangas = ArrayList<SManga>(pagedElements.size)
-        for (element in pagedElements) {
-            val fixedAbsUrl = getSafeAbsoluteUrl(element)
-            val relPath = fixedAbsUrl.removePrefix(baseUrl)
-            val cleanAbsUrl = fixedAbsUrl.removeSuffix("/")
-            
-            mangas.add(SManga.create().apply {
-                title = element.text().cleanTitle()
-                url = if (relPath.startsWith("/")) relPath else "/$relPath"
-                thumbnail_url = "$cleanAbsUrl/${defaultCoverName.trim()}"
-            })
-        }
-        
-        return MangasPage(mangas, endIndex < filteredElements.size)
+
+        val document = resolveDocument(response)
+        val filteredEntries = getValidLinkEntries(document) { it.endsWith("/") }
+            .filter { it.text.cleanTitle().lowercase(Locale.ROOT).contains(query) }
+
+        return buildMangasPage(filteredEntries, currentPage)
     }
 
-    // ─── Manga Details (Cached & Fast) ───────────────────────────────────────
-    
-    override fun mangaDetailsParse(document: Document): SManga {
-        val mangaUrl = document.baseUri()
-        
-        // Cek cache dulu
-        mangaMetaCache.get(mangaUrl)?.let { cachedMeta ->
-            return SManga.create().apply {
-                title = cachedMeta.title ?: ""
-                description = cachedMeta.description ?: "Folder manga lokal dari Server LocalStream."
-                author = cachedMeta.author ?: "Unknown"
-                artist = cachedMeta.artist ?: "Unknown"
-                genre = cachedMeta.genre
-                status = cachedMeta.status
-                initialized = true
+    private fun buildMangasPage(entries: List<LinkEntry>, currentPage: Int): MangasPage {
+        val itemsPerPage = 24
+        val startIndex = (currentPage - 1) * itemsPerPage
+        if (startIndex >= entries.size) return MangasPage(emptyList(), false)
+
+        val endIndex = minOf(startIndex + itemsPerPage, entries.size)
+        val pagedEntries = entries.subList(startIndex, endIndex)
+
+        val mangas = pagedEntries.map { entry ->
+            SManga.create().apply {
+                title = entry.text.cleanTitle()
+
+                val relPath = entry.absUrl.removePrefix(baseUrl)
+                url = if (relPath.startsWith("/")) relPath else "/$relPath"
+
+                val cleanAbsUrl = entry.absUrl.removeSuffix("/")
+                thumbnail_url = "$cleanAbsUrl/$defaultCoverName"
             }
         }
-        
-        // Cari cover
-        val imageLinks = getValidChildElements(document, requireText = false) { href ->
-            imageExtensions.any { href.endsWith(it) }
+
+        return MangasPage(mangas, endIndex < entries.size)
+    }
+
+    // ─── Manga Details ───────────────────────────────────────────────────────
+
+    override fun mangaDetailsParse(document: Document): SManga {
+        val imageLinks = getValidLinkEntries(document, requireText = false) { href ->
+            IMAGE_EXTENSIONS.any { href.endsWith(it) }
         }
-        
-        val coverElement = imageLinks.find { 
-            val href = it.attr("href").lowercase(Locale.ROOT)
+
+        val coverEntry = imageLinks.find { entry ->
+            val href = entry.element.attr("href").lowercase(Locale.ROOT)
             href.contains("cover") || href.contains("poster") || href.contains("thumb")
         } ?: imageLinks.firstOrNull()
-        
+
         val manga = SManga.create().apply {
             description = "Folder manga lokal dari Server LocalStream (WebDAV/HTTP)."
             status = SManga.UNKNOWN
-            if (coverElement != null) {
-                thumbnail_url = getSafeAbsoluteUrl(coverElement, mangaUrl)
+            if (coverEntry != null) {
+                thumbnail_url = coverEntry.absUrl
             }
             initialized = true
         }
-        
-        // Parse ComicInfo.xml
-        val comicInfoXml = getComicInfoXml(document)
+
+        val comicInfoXml = getComicInfoXml(document, document.baseUri())
         if (comicInfoXml.isNotBlank()) {
-            val meta = parseComicInfo(comicInfoXml)
-            mangaMetaCache.put(mangaUrl, meta)
-            
-            meta.title?.let { manga.title = it }
-            meta.description?.let { manga.description = it }
-            meta.author?.let { manga.author = it }
-            meta.artist?.let { manga.artist = it }
-            meta.genre?.let { manga.genre = it }
-            manga.status = meta.status
-        } else {
-            mangaMetaCache.put(mangaUrl, MangaMeta())
+            parseComicInfo(comicInfoXml, manga)
         }
-        
+
         return manga
     }
 
-    // ─── Chapter List (Cached & Optimized) ───────────────────────────────────
-    
+    // ─── Chapter List ────────────────────────────────────────────────────────
+
     override fun chapterListRequest(manga: SManga): Request = GET(baseUrl + manga.url, headers)
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val mangaUrl = response.request.url.toString()
-        
-        // Cek cache chapter
-        chapterCache.get(mangaUrl)?.let { return it }
-        
-        val document = response.asJsoup()
-        val chapterElements = getValidChildElements(document) { href ->
+        val document = resolveDocument(response)
+
+        val chapterEntries = getValidLinkEntries(document) { href ->
             href.endsWith("/") || href.endsWith(".cbz") || href.endsWith(".zip")
-        }
-        
-        val sortedElements = chapterElements.sortedWith { a, b -> 
-            naturalComparator.compare(a.text(), b.text()) 
-        }
-        
-        val total = sortedElements.size
-        val chapters = ArrayList<SChapter>(total)
-        
-        // Hindari reversed() yang membuat copy list baru
-        for (i in sortedElements.indices.reversed()) {
-            val element = sortedElements[i]
-            val fixedAbsUrl = getSafeAbsoluteUrl(element)
-            val relPath = fixedAbsUrl.removePrefix(baseUrl)
-            
-            chapters.add(SChapter.create().apply {
-                name = element.text().cleanTitle()
+        }.naturalSorted()
+
+        return chapterEntries.mapIndexed { index, entry ->
+            SChapter.create().apply {
+                name = entry.text.cleanTitle()
+
+                val relPath = entry.absUrl.removePrefix(baseUrl)
                 url = if (relPath.startsWith("/")) relPath else "/$relPath"
-                chapter_number = (total - i).toFloat()
-            })
-        }
-        
-        chapterCache.put(mangaUrl, chapters)
-        return chapters
+
+                chapter_number = (index + 1).toFloat()
+            }
+        }.asReversed()
     }
 
-    // ─── Page List (Optimized) ───────────────────────────────────────────────
-    
+    // ─── Page List ───────────────────────────────────────────────────────────
+
     override fun pageListRequest(chapter: SChapter): Request = GET(baseUrl + chapter.url, headers)
 
     override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-        val pageElements = getValidChildElements(document, requireText = false) { href ->
-            imageExtensions.any { href.endsWith(it) }
-        }
-        
-        val sortedPages = pageElements.sortedWith { a, b -> 
-            naturalComparator.compare(a.text(), b.text()) 
-        }
-        
-        return sortedPages.mapIndexed { index, element ->
-            Page(index, "", getSafeAbsoluteUrl(element))
-        }
+        val document = resolveDocument(response)
+
+        val pageEntries = getValidLinkEntries(document, requireText = false) { href ->
+            PAGE_IMAGE_EXTENSIONS.any { href.endsWith(it) }
+        }.naturalSorted()
+
+        return pageEntries.mapIndexed { index, entry -> Page(index, "", entry.absUrl) }
     }
 
-    // ─── Unused Overrides ────────────────────────────────────────────────────
+    // ─── Unused / Overrides ──────────────────────────────────────────────────
     override fun popularMangaSelector(): String = ""
     override fun popularMangaFromElement(element: Element): SManga = SManga.create()
     override fun popularMangaNextPageSelector(): String? = null
@@ -552,5 +481,15 @@ iyomi"] ?: tags["status"]
     companion object {
         private const val BASE_URL_PREF = "BASE_URL_PREF_LOCALSTREAM_MANGA"
         private const val COVER_NAME_PREF = "COVER_NAME_PREF_LOCALSTREAM_MANGA"
+
+        // Berapa lama listing direktori / ComicInfo.xml dianggap "masih segar"
+        // sebelum diambil ulang dari server. 60 detik cukup untuk menghapus
+        // hampir semua request berulang dalam satu sesi browsing, tapi tetap
+        // pendek supaya perubahan file di server lokal cepat terlihat.
+        private const val CACHE_TTL_MS = 60_000L
+
+        private val COVER_FALLBACK_EXTENSIONS = listOf("jpg", "jpeg", "png", "webp", "avif", "gif")
+        private val IMAGE_EXTENSIONS = listOf(".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".heic", ".jxl")
+        private val PAGE_IMAGE_EXTENSIONS = listOf(".jpg", ".png", ".jpeg", ".webp", ".avif", ".gif", ".heic", ".jxl", ".bmp")
     }
 }
