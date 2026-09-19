@@ -15,16 +15,33 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import okhttp3.Dispatcher
+import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.asResponseBody
+import okio.buffer
+import okio.source
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.io.File
+import java.io.IOException
+import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
@@ -43,6 +60,14 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     private val defaultCoverName: String
         get() = preferences.getString(COVER_NAME_PREF, "cover.jpg")?.trim() ?: "cover.jpg"
 
+    /** Jumlah halaman yang di-prefetch di SETIAP arah (sebelum & sesudah). 0 = nonaktif. */
+    private val prefetchRadius: Int
+        get() = preferences.getString(PREFETCH_PREF, DEFAULT_PREFETCH_RADIUS.toString())
+            ?.trim()
+            ?.toIntOrNull()
+            ?.coerceIn(0, MAX_PREFETCH_RADIUS)
+            ?: DEFAULT_PREFETCH_RADIUS
+
     // ─── Client: disetel untuk server lokal/LAN yang cepat ───────────────────
     // - Timeout dipersingkat karena server biasanya ada di localhost/LAN, jadi
     //   kalau server mati sebaiknya gagal cepat, bukan menggantung lama.
@@ -50,7 +75,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     //   (server lokal), padahal default OkHttp cuma izinkan 5 request paralel
     //   per host. Itu bikin grid cover (mis. 24 thumbnail sekaligus) antre
     //   dan terasa lambat padahal servernya lokal & sanggup lebih cepat.
-    override val client: OkHttpClient = network.client.newBuilder()
+    private val baseClient: OkHttpClient = network.client.newBuilder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .writeTimeout(10, TimeUnit.SECONDS)
@@ -60,6 +85,26 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
                 maxRequestsPerHost = 32
             },
         )
+        .build()
+
+    // ─── Prefetch halaman ────────────────────────────────────────────────────
+    // Reader Mihon hanya preload beberapa halaman ke depan dan mengunduhnya
+    // satu per satu; itu tidak bisa diubah dari extension. Jadi prefetch
+    // dilakukan di lapisan OkHttp: begitu reader meminta halaman N, kita
+    // unduh N±radius secara PARALEL ke cache disk. Saat reader meminta
+    // halaman tetangga, jawabannya langsung dari disk (hampir instan).
+    //
+    // Client prefetch dipisah (tanpa interceptor prefetch) supaya request
+    // prefetch tidak memicu prefetch lagi (rekursi).
+    private val prefetcher: PagePrefetcher by lazy {
+        PagePrefetcher(
+            client = baseClient.newBuilder().cache(null).build(),
+            headersProvider = { headers },
+            cacheDirProvider = { Injekt.get<Application>().cacheDir },
+        )
+    }
+
+    override val client: OkHttpClient = baseClient.newBuilder()
         .addInterceptor { chain ->
             val originalRequest = chain.request()
             var response = chain.proceed(originalRequest)
@@ -82,6 +127,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             }
             response
         }
+        .addInterceptor { chain -> prefetcher.intercept(chain, prefetchRadius) }
         .build()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
@@ -100,6 +146,15 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             setDefaultValue("cover.jpg")
         }
         screen.addPreference(coverNamePref)
+
+        val prefetchPref = EditTextPreference(screen.context).apply {
+            key = PREFETCH_PREF
+            title = "Prefetch Halaman (sebelum & sesudah)"
+            summary = "Jumlah halaman di sekitar halaman aktif yang diunduh paralel " +
+                "(0 = nonaktif, maks $MAX_PREFETCH_RADIUS). Default: $DEFAULT_PREFETCH_RADIUS."
+            setDefaultValue(DEFAULT_PREFETCH_RADIUS.toString())
+        }
+        screen.addPreference(prefetchPref)
     }
 
     // ─── Cache ringan untuk listing direktori & ComicInfo.xml ────────────────
@@ -459,6 +514,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             PAGE_IMAGE_EXTENSIONS.any { href.endsWith(it) }
         }.naturalSorted()
 
+        // Daftarkan URUTAN halaman chapter ini supaya interceptor tahu siapa
+        // "5 sebelum / 5 sesudah" dari halaman yang sedang diminta reader.
+        prefetcher.registerChapter(pageEntries.map { it.absUrl })
+
         return pageEntries.mapIndexed { index, entry -> Page(index, "", entry.absUrl) }
     }
 
@@ -481,6 +540,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     companion object {
         private const val BASE_URL_PREF = "BASE_URL_PREF_LOCALSTREAM_MANGA"
         private const val COVER_NAME_PREF = "COVER_NAME_PREF_LOCALSTREAM_MANGA"
+        private const val PREFETCH_PREF = "PREFETCH_PREF_LOCALSTREAM_MANGA"
+
+        private const val DEFAULT_PREFETCH_RADIUS = 5
+        private const val MAX_PREFETCH_RADIUS = 15
 
         // Berapa lama listing direktori / ComicInfo.xml dianggap "masih segar"
         // sebelum diambil ulang dari server. 60 detik cukup untuk menghapus
@@ -491,5 +554,288 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         private val COVER_FALLBACK_EXTENSIONS = listOf("jpg", "jpeg", "png", "webp", "avif", "gif")
         private val IMAGE_EXTENSIONS = listOf(".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".heic", ".jxl")
         private val PAGE_IMAGE_EXTENSIONS = listOf(".jpg", ".png", ".jpeg", ".webp", ".avif", ".gif", ".heic", ".jxl", ".bmp")
+    }
+}
+
+/**
+ * Prefetch halaman manga secara paralel ke cache disk.
+ *
+ * Alur:
+ * 1. pageListParse() memanggil [registerChapter] → kita ingat urutan URL halaman.
+ * 2. Reader meminta gambar halaman N → [intercept] mengenali URL itu, lalu
+ *    mengantrekan unduhan N+1..N+radius dan N-1..N-radius ke thread pool
+ *    (maks [PARALLELISM] unduhan bersamaan; arah depan didahulukan).
+ * 3. Saat reader meminta halaman yang sudah/sedang di-prefetch:
+ *    - sudah selesai  → dilayani langsung dari disk (tanpa jaringan),
+ *    - sedang jalan   → ditunggu (tidak mengunduh dua kali),
+ *    - masih antre    → antrean dibatalkan, request asli langsung jalan.
+ *
+ * Kenapa bukan OkHttp Cache: Mihon memanggil getImage() lewat
+ * newCachelessCallWithProgress() yang memang mematikan cache OkHttp, jadi kita
+ * pakai cache sendiri. Salinan di disk dihapus setelah dilayani karena Mihon
+ * menyimpan gambar itu di ChapterCache miliknya.
+ */
+private class PagePrefetcher(
+    private val client: OkHttpClient,
+    private val headersProvider: () -> Headers,
+    private val cacheDirProvider: () -> File,
+) {
+
+    private class PageRef(val pages: List<String>, val index: Int) {
+        /** true = reader sudah pernah meminta halaman ini (berarti sudah ada di ChapterCache Mihon). */
+        @Volatile
+        var requested: Boolean = false
+    }
+
+    private val refs = ConcurrentHashMap<String, PageRef>()
+    private val chapters = LinkedHashMap<String, List<String>>() // dijaga lewat synchronized(chapters)
+    private val tasks = ConcurrentHashMap<String, Task>()
+
+    private val executor = ThreadPoolExecutor(
+        PARALLELISM,
+        PARALLELISM,
+        30L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue<Runnable>(),
+        ThreadFactory { runnable -> Thread(runnable, "LocalStream-prefetch").apply { isDaemon = true } },
+    ).apply { allowCoreThreadTimeOut(true) }
+
+    private val dir: File by lazy { File(cacheDirProvider(), DIR_NAME).also { it.mkdirs() } }
+
+    @Volatile
+    private var lastTrimAt = 0L
+
+    // ─── Indeks urutan halaman ───────────────────────────────────────────────
+
+    fun registerChapter(rawUrls: List<String>) {
+        // Normalisasi lewat HttpUrl supaya PERSIS sama dengan request.url.toString() di interceptor.
+        val urls = rawUrls.map { it.toHttpUrlOrNull()?.toString() ?: it }
+        if (urls.isEmpty()) return
+
+        synchronized(chapters) {
+            chapters.remove(urls.first())?.forEach { refs.remove(it) }
+            chapters[urls.first()] = urls
+            urls.forEachIndexed { i, u -> refs[u] = PageRef(urls, i) }
+
+            // Batasi memori: simpan indeks beberapa chapter terakhir saja.
+            while (chapters.size > MAX_INDEXED_CHAPTERS) {
+                val eldest = chapters.keys.first()
+                chapters.remove(eldest)?.forEach { refs.remove(it) }
+            }
+        }
+    }
+
+    // ─── Interceptor ─────────────────────────────────────────────────────────
+
+    fun intercept(chain: Interceptor.Chain, radius: Int): Response {
+        val request = chain.request()
+        if (radius <= 0) return chain.proceed(request)
+
+        val url = request.url.toString()
+        // Bukan halaman chapter (cover, listing, dll.) → lewat tanpa overhead.
+        val ref = refs[url] ?: return chain.proceed(request)
+
+        ref.requested = true
+        // Antrekan tetangga DULU, supaya berjalan paralel dengan unduhan halaman ini.
+        scheduleNeighbors(ref, radius)
+
+        return serveFromPrefetch(request, url) ?: chain.proceed(request)
+    }
+
+    private fun neighborUrls(ref: PageRef, radius: Int): List<String> {
+        val result = ArrayList<String>(radius * 2)
+
+        fun add(i: Int) {
+            val u = ref.pages.getOrNull(i) ?: return
+            if (refs[u]?.requested == true) return // sudah pernah diminta reader
+            result.add(u)
+        }
+
+        for (d in 1..radius) add(ref.index + d) // arah baca dominan: ke depan dulu
+        for (d in 1..radius) add(ref.index - d)
+        return result
+    }
+
+    private fun scheduleNeighbors(ref: PageRef, radius: Int) {
+        val targets = neighborUrls(ref, radius)
+        val wanted = HashSet(targets)
+
+        // User melompat jauh → buang antrean yang sudah tidak relevan (yang sudah jalan dibiarkan).
+        for ((queuedUrl, task) in tasks) {
+            if (queuedUrl !in wanted) task.cancelIfQueued()
+        }
+
+        for (target in targets) {
+            if (fileFor(target).exists()) continue
+            val task = Task(target)
+            if (tasks.putIfAbsent(target, task) == null) {
+                try {
+                    executor.execute(task)
+                } catch (e: RejectedExecutionException) {
+                    tasks.remove(target, task)
+                }
+            }
+        }
+
+        trimIfNeeded()
+    }
+
+    private fun serveFromPrefetch(request: Request, url: String): Response? {
+        tasks[url]?.let { task ->
+            // Belum mulai → batalkan, request asli langsung ke jaringan (lebih cepat daripada antre).
+            // Sedang berjalan → tunggu hasilnya, jangan unduh dua kali.
+            if (!task.cancelIfQueued()) task.await(WAIT_RUNNING_SECONDS)
+        }
+
+        val file = fileFor(url)
+        if (!file.isFile) return null
+
+        if (System.currentTimeMillis() - file.lastModified() > FILE_TTL_MS) {
+            file.delete()
+            return null
+        }
+
+        val length = file.length()
+        val body = try {
+            file.inputStream().source().buffer().asResponseBody(mediaTypeFor(url), length)
+        } catch (e: IOException) {
+            return null
+        }
+        // Aman di Linux/Android: file yang sudah dibuka tetap terbaca meski di-unlink.
+        // Mihon menyimpan gambar ke ChapterCache sendiri, jadi salinan ini tidak diperlukan lagi.
+        file.delete()
+
+        return Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(200)
+            .message("OK")
+            .body(body)
+            .build()
+    }
+
+    // ─── Unduhan ─────────────────────────────────────────────────────────────
+
+    private inner class Task(val url: String) : Runnable {
+        private val state = AtomicInteger(QUEUED)
+        private val done = CountDownLatch(1)
+
+        /** true jika berhasil dibatalkan (belum sempat jalan). */
+        fun cancelIfQueued(): Boolean {
+            if (!state.compareAndSet(QUEUED, CANCELLED)) return false
+            tasks.remove(url, this)
+            done.countDown()
+            return true
+        }
+
+        fun await(seconds: Long) {
+            try {
+                done.await(seconds, TimeUnit.SECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+
+        override fun run() {
+            if (!state.compareAndSet(QUEUED, RUNNING)) return // sudah dibatalkan
+            try {
+                download(url)
+            } catch (e: Exception) {
+                // Prefetch itu best-effort: kalau gagal, reader akan mengunduh sendiri.
+            } finally {
+                state.set(DONE)
+                tasks.remove(url, this)
+                done.countDown()
+            }
+        }
+    }
+
+    private fun download(url: String) {
+        val target = fileFor(url)
+        if (target.exists()) return
+        val tmp = File(target.parentFile, target.name + ".part")
+
+        try {
+            client.newCall(GET(url, headersProvider())).execute().use { response ->
+                if (!response.isSuccessful) return
+                val body = response.body ?: return
+                tmp.outputStream().use { out -> body.byteStream().copyTo(out, 64 * 1024) }
+            }
+            // Rename atomik: reader tidak pernah melihat file yang setengah jadi.
+            if (!tmp.renameTo(target)) tmp.delete()
+        } catch (e: IOException) {
+            tmp.delete()
+        }
+    }
+
+    // ─── Cache disk ──────────────────────────────────────────────────────────
+
+    private fun fileFor(url: String): File = File(dir, md5Hex(url))
+
+    private fun md5Hex(s: String): String =
+        MessageDigest.getInstance("MD5")
+            .digest(s.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+
+    private fun mediaTypeFor(url: String) =
+        when (url.substringBefore('?').substringAfterLast('.').lowercase(Locale.ROOT)) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "webp" -> "image/webp"
+            "gif" -> "image/gif"
+            "avif" -> "image/avif"
+            "heic" -> "image/heic"
+            "jxl" -> "image/jxl"
+            "bmp" -> "image/bmp"
+            else -> null
+        }?.toMediaTypeOrNull()
+
+    /** Hapus file basi & jaga total ukuran folder prefetch di bawah batas (dibatasi tiap 30 detik). */
+    private fun trimIfNeeded() {
+        val now = System.currentTimeMillis()
+        if (now - lastTrimAt < TRIM_INTERVAL_MS) return
+        lastTrimAt = now
+
+        val files = dir.listFiles() ?: return
+        val alive = ArrayList<File>(files.size)
+        var total = 0L
+        for (f in files) {
+            if (now - f.lastModified() > FILE_TTL_MS) {
+                f.delete()
+            } else {
+                alive.add(f)
+                total += f.length()
+            }
+        }
+        if (total <= MAX_DISK_BYTES) return
+
+        alive.sortBy { it.lastModified() }
+        for (f in alive) {
+            if (total <= MAX_DISK_BYTES) break
+            total -= f.length()
+            f.delete()
+        }
+    }
+
+    private companion object {
+        const val DIR_NAME = "localstream_prefetch"
+
+        /** Jumlah unduhan prefetch yang berjalan bersamaan. */
+        const val PARALLELISM = 5
+
+        /** Indeks urutan halaman disimpan untuk N chapter terakhir saja. */
+        const val MAX_INDEXED_CHAPTERS = 4
+
+        const val MAX_DISK_BYTES = 150L * 1024 * 1024
+        const val FILE_TTL_MS = 10 * 60_000L
+        const val TRIM_INTERVAL_MS = 30_000L
+
+        /** Batas tunggu jika halaman yang diminta reader sedang diunduh oleh prefetch. */
+        const val WAIT_RUNNING_SECONDS = 20L
+
+        const val QUEUED = 0
+        const val RUNNING = 1
+        const val DONE = 2
+        const val CANCELLED = 3
     }
 }
