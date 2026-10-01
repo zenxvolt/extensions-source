@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.net.Uri
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -14,6 +15,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import okhttp3.CacheControl
 import okhttp3.Dispatcher
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -34,8 +36,10 @@ import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadFactory
@@ -67,6 +71,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             ?.toIntOrNull()
             ?.coerceIn(0, MAX_PREFETCH_RADIUS)
             ?: DEFAULT_PREFETCH_RADIUS
+
+    /** true = cek isi folder tiap chapter saat daftar chapter dimuat, supaya gambar baru terdeteksi. */
+    private val detectChanges: Boolean
+        get() = preferences.getBoolean(DETECT_CHANGES_PREF, true)
 
     // ─── Client: disetel untuk server lokal/LAN yang cepat ───────────────────
     // - Timeout dipersingkat karena server biasanya ada di localhost/LAN, jadi
@@ -155,6 +163,15 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             setDefaultValue(DEFAULT_PREFETCH_RADIUS.toString())
         }
         screen.addPreference(prefetchPref)
+
+        val detectChangesPref = SwitchPreferenceCompat(screen.context).apply {
+            key = DETECT_CHANGES_PREF
+            title = "Deteksi halaman baru di chapter"
+            summary = "Saat daftar chapter dimuat ulang, isi tiap folder chapter dicek supaya gambar " +
+                "yang ditambah/dihapus langsung terbaca. Matikan jika library besar dan refresh terasa lambat."
+            setDefaultValue(true)
+        }
+        screen.addPreference(detectChangesPref)
     }
 
     // ─── Cache ringan untuk listing direktori & ComicInfo.xml ────────────────
@@ -182,8 +199,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     }
 
     /**
-     * Dipakai saat framework SUDAH mengeksekusi network call dan memberi kita Response
-     * (popularMangaParse/searchMangaParse/chapterListParse/pageListParse). Kalau cache
+     * Dipakai untuk listing root (popularMangaParse/searchMangaParse). Daftar chapter dan
+     * daftar halaman SENGAJA tidak lewat sini: keduanya harus selalu segar. Kalau cache
      * masih segar, kita buang response yang baru (tutup koneksinya) dan pakai hasil parse
      * lama supaya tidak membangun ulang DOM tree dari HTML yang identik.
      */
@@ -480,23 +497,134 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         return manga
     }
 
+    // ─── Deteksi perubahan isi chapter ───────────────────────────────────────
+    // Masalah: Mihon menyimpan daftar halaman chapter di ChapterCache dengan kunci
+    // "mangaId + chapter.url", lalu membacanya LEBIH DULU sebelum bertanya ke
+    // extension. Selama chapter.url tidak berubah, extension tidak pernah ditanya
+    // lagi, jadi gambar baru di folder tidak akan muncul (sampai cache dibersihkan).
+    //
+    // Solusi: hitung "sidik jari" (hash nama file gambar) tiap folder chapter.
+    // Begitu isinya berubah, URL chapter ikut berubah: "/Manga/Ch1/#v=<sidik jari>".
+    // Fragment tidak dikirim ke server, tapi kunci cache Mihon jadi berbeda sehingga
+    // daftar halaman diambil ulang. Di sisi Mihon, chapter lama dan baru dengan nomor
+    // yang sama dianggap SATU chapter yang sama: status baca & bookmark dipertahankan
+    // dan tidak memicu notifikasi "chapter baru".
+    //
+    // "Baseline": sidik jari pertama yang pernah terlihat per chapter disimpan, dan
+    // selama isi folder sama dengan baseline, URL dibiarkan polos (tanpa #v=). Jadi
+    // chapter yang sudah ada di library TIDAK berganti URL saat extension ini
+    // diperbarui (kalau berganti, riwayat baca semuanya ikut terhapus oleh Mihon).
+
+    private val fingerprintPrefs: SharedPreferences by lazy {
+        Injekt.get<Application>().getSharedPreferences("source_${id}_chapter_fingerprints", 0x0000)
+    }
+
+    /** Sidik jari terakhir yang berhasil dihitung; dipakai kalau satu folder gagal dicek sesaat. */
+    private val lastSeenFingerprint = ConcurrentHashMap<String, String>()
+
+    private val fingerprintExecutor: ExecutorService by lazy {
+        ThreadPoolExecutor(
+            FINGERPRINT_PARALLELISM,
+            FINGERPRINT_PARALLELISM,
+            30L,
+            TimeUnit.SECONDS,
+            LinkedBlockingQueue<Runnable>(),
+            ThreadFactory { runnable -> Thread(runnable, "LocalStream-fingerprint").apply { isDaemon = true } },
+        ).apply { allowCoreThreadTimeOut(true) }
+    }
+
+    private fun md5Hex(s: String): String =
+        MessageDigest.getInstance("MD5")
+            .digest(s.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+
+    private fun LinkEntry.relativePath(): String {
+        val relPath = absUrl.removePrefix(baseUrl)
+        return if (relPath.startsWith("/")) relPath else "/$relPath"
+    }
+
+    /** Hash nama-nama file gambar di folder chapter. Selalu ke jaringan (tanpa cache). */
+    private fun fetchFolderFingerprint(folderUrl: String): String? = try {
+        client.newCall(GET(folderUrl, headers, CacheControl.FORCE_NETWORK)).execute().use { response ->
+            if (!response.isSuccessful) return@use null
+
+            val names = getValidLinkEntries(response.asJsoup(), requireText = false) { href ->
+                PAGE_IMAGE_EXTENSIONS.any { href.endsWith(it) }
+            }
+                .map { Uri.decode(it.absUrl.substringBefore("#").substringBefore("?")).substringAfterLast('/') }
+                .sorted()
+
+            md5Hex(names.joinToString("\n")).take(FINGERPRINT_LENGTH)
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    /**
+     * Peta absUrl chapter → token versi. Hanya berisi chapter yang isinya SUDAH berbeda
+     * dari baseline; chapter yang tidak berubah tidak dapat token (URL tetap polos).
+     * Folder dicek paralel (maks [FINGERPRINT_PARALLELISM] sekaligus).
+     */
+    private fun chapterVersionTokens(entries: List<LinkEntry>): Map<String, String> {
+        // Arsip (.cbz/.zip) tidak punya isi folder yang bisa dicek.
+        val folders = entries.filter { it.absUrl.substringBefore("#").substringBefore("?").endsWith("/") }
+        if (folders.isEmpty()) return emptyMap()
+
+        val results = fingerprintExecutor.invokeAll(
+            folders.map { entry -> Callable { fetchFolderFingerprint(entry.absUrl) } },
+        )
+
+        val tokens = HashMap<String, String>()
+        val newBaselines = HashMap<String, String>()
+
+        folders.forEachIndexed { i, entry ->
+            val path = entry.relativePath()
+            val fresh = try {
+                results[i].get()
+            } catch (e: Exception) {
+                null
+            }
+            val fingerprint = fresh ?: lastSeenFingerprint[path] ?: return@forEachIndexed
+            lastSeenFingerprint[path] = fingerprint
+
+            val baseline = fingerprintPrefs.getString(path, null)
+            if (baseline == null) {
+                newBaselines[path] = fingerprint
+            } else if (baseline != fingerprint) {
+                tokens[entry.absUrl] = fingerprint
+            }
+        }
+
+        if (newBaselines.isNotEmpty()) {
+            val editor = fingerprintPrefs.edit()
+            newBaselines.forEach { (key, value) -> editor.putString(key, value) }
+            editor.apply()
+        }
+        return tokens
+    }
+
     // ─── Chapter List ────────────────────────────────────────────────────────
 
-    override fun chapterListRequest(manga: SManga): Request = GET(baseUrl + manga.url, headers)
+    // FORCE_NETWORK: GET() bawaan Mihon mengizinkan respons cache OkHttp sampai 10 menit.
+    override fun chapterListRequest(manga: SManga): Request =
+        GET(baseUrl + manga.url, headers, CacheControl.FORCE_NETWORK)
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val document = resolveDocument(response)
+        // Sengaja TIDAK lewat resolveDocument(): daftar chapter harus selalu segar.
+        val document = response.asJsoup()
 
         val chapterEntries = getValidLinkEntries(document) { href ->
             href.endsWith("/") || href.endsWith(".cbz") || href.endsWith(".zip")
         }.naturalSorted()
 
+        val tokens = if (detectChanges) chapterVersionTokens(chapterEntries) else emptyMap()
+
         return chapterEntries.mapIndexed { index, entry ->
             SChapter.create().apply {
                 name = entry.text.cleanTitle()
 
-                val relPath = entry.absUrl.removePrefix(baseUrl)
-                url = if (relPath.startsWith("/")) relPath else "/$relPath"
+                val path = entry.relativePath()
+                url = tokens[entry.absUrl]?.let { "$path#v=$it" } ?: path
 
                 chapter_number = (index + 1).toFloat()
             }
@@ -505,10 +633,12 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     // ─── Page List ───────────────────────────────────────────────────────────
 
-    override fun pageListRequest(chapter: SChapter): Request = GET(baseUrl + chapter.url, headers)
+    override fun pageListRequest(chapter: SChapter): Request =
+        GET(baseUrl + chapter.url, headers, CacheControl.FORCE_NETWORK)
 
     override fun pageListParse(response: Response): List<Page> {
-        val document = resolveDocument(response)
+        // Sengaja TIDAK lewat resolveDocument(): jangan pernah memakai daftar halaman basi.
+        val document = response.asJsoup()
 
         val pageEntries = getValidLinkEntries(document, requireText = false) { href ->
             PAGE_IMAGE_EXTENSIONS.any { href.endsWith(it) }
@@ -541,6 +671,11 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         private const val BASE_URL_PREF = "BASE_URL_PREF_LOCALSTREAM_MANGA"
         private const val COVER_NAME_PREF = "COVER_NAME_PREF_LOCALSTREAM_MANGA"
         private const val PREFETCH_PREF = "PREFETCH_PREF_LOCALSTREAM_MANGA"
+        private const val DETECT_CHANGES_PREF = "DETECT_CHANGES_PREF_LOCALSTREAM_MANGA"
+
+        /** Folder chapter yang dicek bersamaan saat daftar chapter dimuat. */
+        private const val FINGERPRINT_PARALLELISM = 8
+        private const val FINGERPRINT_LENGTH = 10
 
         private const val DEFAULT_PREFETCH_RADIUS = 5
         private const val MAX_PREFETCH_RADIUS = 15
