@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.SharedPreferences
 import android.net.Uri
 import androidx.preference.EditTextPreference
+import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
@@ -35,6 +36,7 @@ import uy.kohesive.injekt.api.get
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
+import java.text.Normalizer
 import java.util.Locale
 import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
@@ -77,11 +79,16 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         get() = preferences.getBoolean(DETECT_CHANGES_PREF, true)
 
     /**
-     * true  = judul entri diambil dari <Series> di ComicInfo.xml (kalau ada), menimpa nama folder.
-     * false = judul selalu memakai nama folder, ComicInfo.xml hanya dipakai untuk metadata lain.
+     * Sumber judul entri:
+     * - comicinfo: <Series> di ComicInfo.xml menimpa nama folder (perilaku lama).
+     * - folder   : selalu nama folder.
+     * - auto     : nama folder diprioritaskan. Pengecualian: <Series> dipakai kalau memuat simbol
+     *              khusus (yang tidak bisa ada di nama folder) DAN cocok dengan nama folder
+     *              selain simbolnya. Kalau tidak cocok, <Series> dianggap usang dan nama folder
+     *              yang dipakai.
      */
-    private val useComicInfoTitle: Boolean
-        get() = preferences.getBoolean(USE_COMICINFO_TITLE_PREF, true)
+    private val titleSource: String
+        get() = preferences.getString(TITLE_SOURCE_PREF, TITLE_SOURCE_COMICINFO) ?: TITLE_SOURCE_COMICINFO
 
     // ─── Client: disetel untuk server lokal/LAN yang cepat ───────────────────
     // - Timeout dipersingkat karena server biasanya ada di localhost/LAN, jadi
@@ -180,15 +187,19 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         }
         screen.addPreference(detectChangesPref)
 
-        val comicInfoTitlePref = SwitchPreferenceCompat(screen.context).apply {
-            key = USE_COMICINFO_TITLE_PREF
-            title = "Pakai judul dari ComicInfo (Series)"
-            summary = "Aktif: judul diambil dari tag <Series> di ComicInfo.xml jika ada, menimpa nama folder. " +
-                "Nonaktif: judul selalu memakai nama folder. Judul entri yang sudah tersimpan di aplikasi " +
-                "baru ikut berubah setelah Clear database (untuk entri di luar library) atau refresh detail."
-            setDefaultValue(true)
+        val titleSourcePref = ListPreference(screen.context).apply {
+            key = TITLE_SOURCE_PREF
+            title = "Sumber judul entri"
+            entries = arrayOf(
+                "ComicInfo dulu (<Series> menimpa nama folder)",
+                "Nama folder saja",
+                "Otomatis (nama folder, kecuali judul bersimbol khusus)",
+            )
+            entryValues = arrayOf(TITLE_SOURCE_COMICINFO, TITLE_SOURCE_FOLDER, TITLE_SOURCE_AUTO)
+            setDefaultValue(TITLE_SOURCE_COMICINFO)
+            summary = "%s"
         }
-        screen.addPreference(comicInfoTitlePref)
+        screen.addPreference(titleSourcePref)
     }
 
     // ─── Cache ringan untuk listing direktori & ComicInfo.xml ────────────────
@@ -389,8 +400,8 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         return regex.find(xml)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotBlank() }
     }
 
+    /** Judul TIDAK diatur di sini; lihat [resolveTitle] yang dipanggil dari mangaDetailsParse. */
     private fun parseComicInfo(xml: String, manga: SManga) {
-        val series = extractXmlTag(xml, "Series")
         val summary = extractXmlTag(xml, "Summary")?.cleanTitle()
 
         val writer = extractXmlTag(xml, "Writer")
@@ -400,9 +411,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val genre = extractXmlTag(xml, "Genre")
         val categories = extractXmlTag(xml, "Categories")
 
-        if (useComicInfoTitle && !series.isNullOrBlank()) {
-            manga.title = series.cleanTitle()
-        }
         if (!summary.isNullOrBlank()) {
             manga.description = summary
         }
@@ -511,11 +519,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             parseComicInfo(comicInfoXml, manga)
         }
 
-        // Judul ComicInfo dimatikan: kirim nama folder supaya judul yang sudah tersimpan di
-        // aplikasi (mis. hasil <Series> lama) ikut dikoreksi saat detail di-refresh.
-        if (!useComicInfoTitle) {
-            folderTitle(document)?.let { manga.title = it }
-        }
+        // Judul ditentukan sesuai pengaturan "Sumber judul entri". Kalau hasilnya null (mode
+        // comicinfo tanpa <Series>), judul tidak dikirim dan aplikasi mempertahankan judul lamanya.
+        val series = if (comicInfoXml.isNotBlank()) extractXmlTag(comicInfoXml, "Series")?.cleanTitle() else null
+        resolveTitle(series, folderTitle(document))?.let { manga.title = it }
 
         return manga
     }
@@ -525,6 +532,36 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val path = document.baseUri().substringBefore("#").substringBefore("?").trimEnd('/')
         return Uri.decode(path.substringAfterLast('/')).cleanTitle().takeIf { it.isNotBlank() }
     }
+
+    private fun resolveTitle(series: String?, folderName: String?): String? = when (titleSource) {
+        TITLE_SOURCE_FOLDER -> folderName
+        TITLE_SOURCE_AUTO -> when {
+            series != null && folderName != null &&
+                hasSpecialChars(series) && isSameTitle(series, folderName) -> series
+            else -> folderName ?: series
+        }
+        else -> series
+    }
+
+    /** true jika ada karakter selain huruf, angka, dan spasi (mis. : ? / ! ' . ～). */
+    private fun hasSpecialChars(s: String): Boolean = s.any { !it.isLetterOrDigit() && !it.isWhitespace() }
+
+    /**
+     * Nama folder tidak boleh memuat sebagian simbol (: ? * " < > | /), jadi <Series> yang benar
+     * bisa berbeda dari nama folder HANYA di simbol/spasi/huruf besar-kecil. Kedua judul
+     * dibandingkan setelah NFKC (mis. "：" lebar-penuh menjadi ":") dan setelah membuang semua
+     * karakter selain huruf/angka.
+     */
+    private fun isSameTitle(a: String, b: String): Boolean {
+        val normalizedA = normalizeTitle(a)
+        // Judul yang seluruhnya simbol jadi kosong setelah normalisasi; jangan dianggap cocok.
+        return normalizedA.isNotEmpty() && normalizedA == normalizeTitle(b)
+    }
+
+    private fun normalizeTitle(s: String): String =
+        Normalizer.normalize(s, Normalizer.Form.NFKC)
+            .lowercase(Locale.ROOT)
+            .filter { it.isLetterOrDigit() }
 
     // ─── Deteksi perubahan isi chapter ───────────────────────────────────────
     // Masalah: Mihon menyimpan daftar halaman chapter di ChapterCache dengan kunci
@@ -701,7 +738,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         private const val COVER_NAME_PREF = "COVER_NAME_PREF_LOCALSTREAM_MANGA"
         private const val PREFETCH_PREF = "PREFETCH_PREF_LOCALSTREAM_MANGA"
         private const val DETECT_CHANGES_PREF = "DETECT_CHANGES_PREF_LOCALSTREAM_MANGA"
-        private const val USE_COMICINFO_TITLE_PREF = "USE_COMICINFO_TITLE_PREF_LOCALSTREAM_MANGA"
+        private const val TITLE_SOURCE_PREF = "TITLE_SOURCE_PREF_LOCALSTREAM_MANGA"
+        private const val TITLE_SOURCE_COMICINFO = "comicinfo"
+        private const val TITLE_SOURCE_FOLDER = "folder"
+        private const val TITLE_SOURCE_AUTO = "auto"
 
         /** Folder chapter yang dicek bersamaan saat daftar chapter dimuat. */
         private const val FINGERPRINT_PARALLELISM = 8
