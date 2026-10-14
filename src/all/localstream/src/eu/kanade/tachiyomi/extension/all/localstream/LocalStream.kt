@@ -76,6 +76,13 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     private val detectChanges: Boolean
         get() = preferences.getBoolean(DETECT_CHANGES_PREF, true)
 
+    /**
+     * true  = judul entri diambil dari <Series> di ComicInfo.xml (kalau ada), menimpa nama folder.
+     * false = judul selalu memakai nama folder, ComicInfo.xml hanya dipakai untuk metadata lain.
+     */
+    private val useComicInfoTitle: Boolean
+        get() = preferences.getBoolean(USE_COMICINFO_TITLE_PREF, true)
+
     // ─── Client: disetel untuk server lokal/LAN yang cepat ───────────────────
     // - Timeout dipersingkat karena server biasanya ada di localhost/LAN, jadi
     //   kalau server mati sebaiknya gagal cepat, bukan menggantung lama.
@@ -172,6 +179,16 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             setDefaultValue(true)
         }
         screen.addPreference(detectChangesPref)
+
+        val comicInfoTitlePref = SwitchPreferenceCompat(screen.context).apply {
+            key = USE_COMICINFO_TITLE_PREF
+            title = "Pakai judul dari ComicInfo (Series)"
+            summary = "Aktif: judul diambil dari tag <Series> di ComicInfo.xml jika ada, menimpa nama folder. " +
+                "Nonaktif: judul selalu memakai nama folder. Judul entri yang sudah tersimpan di aplikasi " +
+                "baru ikut berubah setelah Clear database (untuk entri di luar library) atau refresh detail."
+            setDefaultValue(true)
+        }
+        screen.addPreference(comicInfoTitlePref)
     }
 
     // ─── Cache ringan untuk listing direktori & ComicInfo.xml ────────────────
@@ -383,7 +400,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val genre = extractXmlTag(xml, "Genre")
         val categories = extractXmlTag(xml, "Categories")
 
-        if (!series.isNullOrBlank()) {
+        if (useComicInfoTitle && !series.isNullOrBlank()) {
             manga.title = series.cleanTitle()
         }
         if (!summary.isNullOrBlank()) {
@@ -494,7 +511,19 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             parseComicInfo(comicInfoXml, manga)
         }
 
+        // Judul ComicInfo dimatikan: kirim nama folder supaya judul yang sudah tersimpan di
+        // aplikasi (mis. hasil <Series> lama) ikut dikoreksi saat detail di-refresh.
+        if (!useComicInfoTitle) {
+            folderTitle(document)?.let { manga.title = it }
+        }
+
         return manga
+    }
+
+    /** Nama folder entri, diambil dari segmen terakhir URL halaman detail. */
+    private fun folderTitle(document: Document): String? {
+        val path = document.baseUri().substringBefore("#").substringBefore("?").trimEnd('/')
+        return Uri.decode(path.substringAfterLast('/')).cleanTitle().takeIf { it.isNotBlank() }
     }
 
     // ─── Deteksi perubahan isi chapter ───────────────────────────────────────
@@ -672,6 +701,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         private const val COVER_NAME_PREF = "COVER_NAME_PREF_LOCALSTREAM_MANGA"
         private const val PREFETCH_PREF = "PREFETCH_PREF_LOCALSTREAM_MANGA"
         private const val DETECT_CHANGES_PREF = "DETECT_CHANGES_PREF_LOCALSTREAM_MANGA"
+        private const val USE_COMICINFO_TITLE_PREF = "USE_COMICINFO_TITLE_PREF_LOCALSTREAM_MANGA"
 
         /** Folder chapter yang dicek bersamaan saat daftar chapter dimuat. */
         private const val FINGERPRINT_PARALLELISM = 8
