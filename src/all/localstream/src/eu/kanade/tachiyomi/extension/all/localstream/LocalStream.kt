@@ -88,7 +88,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
      *              yang dipakai.
      */
     private val titleSource: String
-        get() = preferences.getString(TITLE_SOURCE_PREF, TITLE_SOURCE_COMICINFO) ?: TITLE_SOURCE_COMICINFO
+        get() = preferences.getString(TITLE_SOURCE_PREF, TITLE_SOURCE_AUTO) ?: TITLE_SOURCE_AUTO
 
     // ─── Client: disetel untuk server lokal/LAN yang cepat ───────────────────
     // - Timeout dipersingkat karena server biasanya ada di localhost/LAN, jadi
@@ -156,47 +156,48 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val baseUrlPref = EditTextPreference(screen.context).apply {
             key = BASE_URL_PREF
             title = "Server URL (Round Sync / Termux)"
-            summary = "Masukkan URL lokal dari Rclone Serve."
+            summary = "Enter the local URL of your Rclone Serve instance."
             setDefaultValue("http://127.0.0.1:8080")
         }
         screen.addPreference(baseUrlPref)
 
         val coverNamePref = EditTextPreference(screen.context).apply {
             key = COVER_NAME_PREF
-            title = "Nama File Cover Default"
-            summary = "Nama dasar cover (Contoh: cover.jpg)."
+            title = "Default Cover File Name"
+            summary = "Base name of the cover file (e.g. cover.jpg)."
             setDefaultValue("cover.jpg")
         }
         screen.addPreference(coverNamePref)
 
         val prefetchPref = EditTextPreference(screen.context).apply {
             key = PREFETCH_PREF
-            title = "Prefetch Halaman (sebelum & sesudah)"
-            summary = "Jumlah halaman di sekitar halaman aktif yang diunduh paralel " +
-                "(0 = nonaktif, maks $MAX_PREFETCH_RADIUS). Default: $DEFAULT_PREFETCH_RADIUS."
+            title = "Page Prefetch (before & after)"
+            summary = "Number of pages around the current page that are downloaded in parallel " +
+                "(0 = disabled, max $MAX_PREFETCH_RADIUS). Default: $DEFAULT_PREFETCH_RADIUS."
             setDefaultValue(DEFAULT_PREFETCH_RADIUS.toString())
         }
         screen.addPreference(prefetchPref)
 
         val detectChangesPref = SwitchPreferenceCompat(screen.context).apply {
             key = DETECT_CHANGES_PREF
-            title = "Deteksi halaman baru di chapter"
-            summary = "Saat daftar chapter dimuat ulang, isi tiap folder chapter dicek supaya gambar " +
-                "yang ditambah/dihapus langsung terbaca. Matikan jika library besar dan refresh terasa lambat."
+            title = "Detect new pages in chapters"
+            summary = "When the chapter list is refreshed, each chapter folder is checked so added or " +
+                "removed images are picked up right away. Turn this off if your library is large and " +
+                "refreshing feels slow."
             setDefaultValue(true)
         }
         screen.addPreference(detectChangesPref)
 
         val titleSourcePref = ListPreference(screen.context).apply {
             key = TITLE_SOURCE_PREF
-            title = "Sumber judul entri"
+            title = "Entry Title Source"
             entries = arrayOf(
-                "ComicInfo dulu (<Series> menimpa nama folder)",
-                "Nama folder saja",
-                "Otomatis (nama folder, kecuali judul bersimbol khusus)",
+                "ComicInfo first (<Series> overrides the folder name)",
+                "Folder name only",
+                "Automatic (folder name, unless the title has special symbols)",
             )
             entryValues = arrayOf(TITLE_SOURCE_COMICINFO, TITLE_SOURCE_FOLDER, TITLE_SOURCE_AUTO)
-            setDefaultValue(TITLE_SOURCE_COMICINFO)
+            setDefaultValue(TITLE_SOURCE_AUTO)
             summary = "%s"
         }
         screen.addPreference(titleSourcePref)
@@ -214,6 +215,23 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     private data class CachedComicInfo(val xml: String, val fetchedAt: Long)
     private val comicInfoCache = ConcurrentHashMap<String, CachedComicInfo>()
+
+    /** <Series> per folder, used for titles in Browse/Search. A null series is cached too ("no ComicInfo"). */
+    private data class CachedSeries(val series: String?, val fetchedAt: Long)
+    private val seriesCache = ConcurrentHashMap<String, CachedSeries>()
+
+    /** Same key for the same folder, whether it comes from the browse list or the details page. */
+    private fun cacheKeyFor(url: String): String {
+        val clean = url.substringBefore("#")
+        return clean.toHttpUrlOrNull()?.toString() ?: clean
+    }
+
+    /** Folder documents are cached per manga now, so drop expired entries to keep memory bounded. */
+    private fun evictStaleCaches() {
+        documentCache.values.removeIf { !isFresh(it.fetchedAt) }
+        comicInfoCache.values.removeIf { !isFresh(it.fetchedAt) }
+        seriesCache.values.removeIf { !isFresh(it.fetchedAt) }
+    }
 
     private fun isFresh(fetchedAt: Long): Boolean =
         System.currentTimeMillis() - fetchedAt < CACHE_TTL_MS
@@ -478,9 +496,14 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val endIndex = minOf(startIndex + itemsPerPage, entries.size)
         val pagedEntries = entries.subList(startIndex, endIndex)
 
-        val mangas = pagedEntries.map { entry ->
+        // Resolve titles with the same rules as the details page ("Entry Title Source").
+        evictStaleCaches()
+        val seriesTitles = fetchSeriesTitles(pagedEntries)
+
+        val mangas = pagedEntries.mapIndexed { index, entry ->
             SManga.create().apply {
-                title = entry.text.cleanTitle()
+                val folderName = folderTitleFromUrl(entry.absUrl) ?: entry.text.cleanTitle()
+                title = resolveTitle(seriesTitles[index], folderName) ?: folderName
 
                 val relPath = entry.absUrl.removePrefix(baseUrl)
                 url = if (relPath.startsWith("/")) relPath else "/$relPath"
@@ -506,7 +529,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         } ?: imageLinks.firstOrNull()
 
         val manga = SManga.create().apply {
-            description = "Folder manga lokal dari Server LocalStream (WebDAV/HTTP)."
+            description = "No description"
             status = SManga.UNKNOWN
             if (coverEntry != null) {
                 thumbnail_url = coverEntry.absUrl
@@ -514,7 +537,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
             initialized = true
         }
 
-        val comicInfoXml = getComicInfoXml(document, document.baseUri())
+        val comicInfoXml = getComicInfoXml(document, cacheKeyFor(document.baseUri()))
         if (comicInfoXml.isNotBlank()) {
             parseComicInfo(comicInfoXml, manga)
         }
@@ -528,8 +551,11 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     }
 
     /** Nama folder entri, diambil dari segmen terakhir URL halaman detail. */
-    private fun folderTitle(document: Document): String? {
-        val path = document.baseUri().substringBefore("#").substringBefore("?").trimEnd('/')
+    private fun folderTitle(document: Document): String? = folderTitleFromUrl(document.baseUri())
+
+    /** Same derivation for browse and details, so both always produce an identical folder name. */
+    private fun folderTitleFromUrl(url: String): String? {
+        val path = url.substringBefore("#").substringBefore("?").trimEnd('/')
         return Uri.decode(path.substringAfterLast('/')).cleanTitle().takeIf { it.isNotBlank() }
     }
 
@@ -562,6 +588,52 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         Normalizer.normalize(s, Normalizer.Form.NFKC)
             .lowercase(Locale.ROOT)
             .filter { it.isLetterOrDigit() }
+
+    // ─── Titles in Browse / Search ───────────────────────────────────────────
+    // The directory listing only knows folder names. To match the details page, the
+    // <Series> of every entry on the current page is fetched in parallel (and cached).
+    // "Folder name only" mode needs no extra requests.
+
+    private val titleExecutor: ExecutorService by lazy {
+        ThreadPoolExecutor(
+            TITLE_PARALLELISM,
+            TITLE_PARALLELISM,
+            30L,
+            TimeUnit.SECONDS,
+            LinkedBlockingQueue<Runnable>(),
+            ThreadFactory { runnable -> Thread(runnable, "LocalStream-title").apply { isDaemon = true } },
+        ).apply { allowCoreThreadTimeOut(true) }
+    }
+
+    private fun fetchSeriesTitles(entries: List<LinkEntry>): List<String?> {
+        if (titleSource == TITLE_SOURCE_FOLDER) return List(entries.size) { null }
+
+        val futures = titleExecutor.invokeAll(
+            entries.map { entry -> Callable { fetchSeriesTitle(entry.absUrl) } },
+        )
+        return futures.map { future ->
+            try {
+                future.get()
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+
+    private fun fetchSeriesTitle(folderUrl: String): String? {
+        val key = cacheKeyFor(folderUrl)
+        seriesCache[key]?.let { cached -> if (isFresh(cached.fetchedAt)) return cached.series }
+
+        val series = try {
+            val xml = comicInfoCache[key]?.takeIf { isFresh(it.fetchedAt) }?.xml
+                ?: getComicInfoXml(client.newCall(GET(folderUrl, headers)).execute().asJsoup(), key)
+            extractXmlTag(xml, "Series")?.cleanTitle()
+        } catch (e: Exception) {
+            return null // transient failure: fall back to the folder name, but don't cache it
+        }
+        seriesCache[key] = CachedSeries(series, System.currentTimeMillis())
+        return series
+    }
 
     // ─── Deteksi perubahan isi chapter ───────────────────────────────────────
     // Masalah: Mihon menyimpan daftar halaman chapter di ChapterCache dengan kunci
@@ -746,6 +818,9 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         /** Folder chapter yang dicek bersamaan saat daftar chapter dimuat. */
         private const val FINGERPRINT_PARALLELISM = 8
         private const val FINGERPRINT_LENGTH = 10
+
+        /** Entry folders whose ComicInfo.xml is read at the same time when building a browse page. */
+        private const val TITLE_PARALLELISM = 8
 
         private const val DEFAULT_PREFETCH_RADIUS = 5
         private const val MAX_PREFETCH_RADIUS = 15
