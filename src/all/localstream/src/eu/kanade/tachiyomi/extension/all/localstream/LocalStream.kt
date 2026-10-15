@@ -47,6 +47,7 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class LocalStream : ParsedHttpSource(), ConfigurableSource {
@@ -216,9 +217,48 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     private data class CachedComicInfo(val xml: String, val fetchedAt: Long)
     private val comicInfoCache = ConcurrentHashMap<String, CachedComicInfo>()
 
-    /** <Series> per folder, used for titles in Browse/Search. A null series is cached too ("no ComicInfo"). */
-    private data class CachedSeries(val series: String?, val fetchedAt: Long)
-    private val seriesCache = ConcurrentHashMap<String, CachedSeries>()
+    /**
+     * <Series> per folder, used for titles in Browse/Search. Persisted (so it survives the app
+     * being killed) and valid for [TITLE_CACHE_TTL_MS]. Stored as "<epochMillis>|<series>".
+     * An empty series means "no <Series> found"; that is only kept for [TITLE_CACHE_MISS_TTL_MS],
+     * so a server that failed for a moment doesn't leave folder names in the list for long.
+     */
+    private class CachedSeries(val series: String?)
+
+    private val seriesPrefs: SharedPreferences by lazy {
+        Injekt.get<Application>().getSharedPreferences("source_${id}_series_titles", 0x0000)
+    }
+
+    private val seriesPruned = AtomicBoolean(false)
+
+    private fun readSeriesCache(key: String): CachedSeries? {
+        val raw = seriesPrefs.getString(key, null) ?: return null
+        val fetchedAt = raw.substringBefore('|').toLongOrNull() ?: return null
+        val age = System.currentTimeMillis() - fetchedAt
+        val series = raw.substringAfter('|').takeIf { it.isNotEmpty() }
+        val ttl = if (series != null) TITLE_CACHE_TTL_MS else TITLE_CACHE_MISS_TTL_MS
+        if (age < 0 || age >= ttl) return null
+        return CachedSeries(series)
+    }
+
+    private fun writeSeriesCache(key: String, series: String?) {
+        seriesPrefs.edit().putString(key, "${System.currentTimeMillis()}|${series.orEmpty()}").apply()
+    }
+
+    /** Once per app process: remove expired entries so the file doesn't keep growing. */
+    private fun pruneSeriesCacheOnce() {
+        if (!seriesPruned.compareAndSet(false, true)) return
+        val now = System.currentTimeMillis()
+        val expired = seriesPrefs.all.filter { (_, value) ->
+            val fetchedAt = (value as? String)?.substringBefore('|')?.toLongOrNull()
+            val age = if (fetchedAt == null) -1L else now - fetchedAt
+            fetchedAt == null || age < 0 || age >= TITLE_CACHE_TTL_MS
+        }.keys
+        if (expired.isEmpty()) return
+        val editor = seriesPrefs.edit()
+        expired.forEach { editor.remove(it) }
+        editor.apply()
+    }
 
     /** Same key for the same folder, whether it comes from the browse list or the details page. */
     private fun cacheKeyFor(url: String): String {
@@ -230,7 +270,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     private fun evictStaleCaches() {
         documentCache.values.removeIf { !isFresh(it.fetchedAt) }
         comicInfoCache.values.removeIf { !isFresh(it.fetchedAt) }
-        seriesCache.values.removeIf { !isFresh(it.fetchedAt) }
+        pruneSeriesCacheOnce()
     }
 
     private fun isFresh(fetchedAt: Long): Boolean =
@@ -536,6 +576,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         // Resolve titles with the same rules as the details page ("Entry Title Source").
         evictStaleCaches()
         val seriesTitles = fetchSeriesTitles(pagedEntries)
+        warmNextPage(entries, endIndex, itemsPerPage)
 
         val mangas = pagedEntries.mapIndexed { index, entry ->
             SManga.create().apply {
@@ -642,6 +683,26 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         ).apply { allowCoreThreadTimeOut(true) }
     }
 
+    // Titles of the NEXT page are read in the background (a few at a time, so covers and the
+    // current page aren't starved), so scrolling down usually finds them already cached.
+    private val titleWarmExecutor: ExecutorService by lazy {
+        ThreadPoolExecutor(
+            TITLE_WARM_PARALLELISM,
+            TITLE_WARM_PARALLELISM,
+            30L,
+            TimeUnit.SECONDS,
+            LinkedBlockingQueue<Runnable>(),
+            ThreadFactory { runnable -> Thread(runnable, "LocalStream-title-warm").apply { isDaemon = true } },
+        ).apply { allowCoreThreadTimeOut(true) }
+    }
+
+    private fun warmNextPage(entries: List<LinkEntry>, from: Int, count: Int) {
+        if (titleSource == TITLE_SOURCE_FOLDER || from >= entries.size) return
+        entries.subList(from, minOf(from + count, entries.size))
+            .map { it.absUrl }
+            .forEach { url -> titleWarmExecutor.execute { fetchSeriesTitle(url) } }
+    }
+
     private fun fetchSeriesTitles(entries: List<LinkEntry>): List<String?> {
         if (titleSource == TITLE_SOURCE_FOLDER) return List(entries.size) { null }
 
@@ -659,7 +720,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     private fun fetchSeriesTitle(folderUrl: String): String? {
         val key = cacheKeyFor(folderUrl)
-        seriesCache[key]?.let { cached -> if (isFresh(cached.fetchedAt)) return cached.series }
+        readSeriesCache(key)?.let { return it.series }
 
         val series = try {
             val xml = comicInfoCache[key]?.takeIf { isFresh(it.fetchedAt) }?.xml
@@ -668,7 +729,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         } catch (e: Exception) {
             return null // transient failure: fall back to the folder name, but don't cache it
         }
-        seriesCache[key] = CachedSeries(series, System.currentTimeMillis())
+        writeSeriesCache(key, series)
         return series
     }
 
@@ -856,8 +917,21 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         private const val FINGERPRINT_PARALLELISM = 8
         private const val FINGERPRINT_LENGTH = 10
 
-        /** Entry folders whose ComicInfo.xml is read at the same time when building a browse page. */
-        private const val TITLE_PARALLELISM = 8
+        /** Entry folders whose ComicInfo.xml is read at the same time (one browse page = 24 entries). */
+        private const val TITLE_PARALLELISM = 24
+
+        /** Background readers for the next page's titles. */
+        private const val TITLE_WARM_PARALLELISM = 4
+
+        /**
+         * How long a <Series> read from ComicInfo.xml is reused for the Browse list (also across
+         * app restarts). Editing a ComicInfo.xml shows up in Browse after this long; the details
+         * page always re-reads it.
+         */
+        private const val TITLE_CACHE_TTL_MS = 30 * 60_000L
+
+        /** Same, for folders where no <Series> was found. */
+        private const val TITLE_CACHE_MISS_TTL_MS = 5 * 60_000L
 
         private const val DEFAULT_PREFETCH_RADIUS = 5
         private const val MAX_PREFETCH_RADIUS = 15
