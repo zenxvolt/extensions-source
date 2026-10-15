@@ -482,10 +482,47 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val currentPage = fragment.substringAfter("page=").toIntOrNull() ?: 1
 
         val document = resolveDocument(response)
-        val filteredEntries = getValidLinkEntries(document) { it.endsWith("/") }
-            .filter { it.text.cleanTitle().lowercase(Locale.ROOT).contains(query) }
+        val filteredEntries = filterByQuery(getValidLinkEntries(document) { it.endsWith("/") }, query)
 
         return buildMangasPage(filteredEntries, currentPage)
+    }
+
+    /**
+     * Matches the query against entry names. Besides a plain "contains" on the folder name, both
+     * sides are normalized (NFKC, lowercase, letters/digits only), so "Re:Zero" or "Re：Zero" still
+     * finds the folder "Re Zero". This is the same rule "Automatic" mode uses to decide that
+     * <Series> and the folder name are the same title, so whatever title is shown in the list
+     * can also be found by searching for it (this is what library migration relies on).
+     * In "ComicInfo first" mode <Series> may differ completely from the folder name, so it is
+     * searched too (read in parallel and cached, so large libraries are slower on the first search).
+     */
+    private fun filterByQuery(entries: List<LinkEntry>, query: String): List<LinkEntry> {
+        val rawQuery = query.trim()
+        if (rawQuery.isEmpty()) return entries
+        val normalizedQuery = normalizeTitle(rawQuery)
+
+        fun matches(name: String): Boolean =
+            name.lowercase(Locale.ROOT).contains(rawQuery) ||
+                (normalizedQuery.isNotEmpty() && normalizeTitle(name).contains(normalizedQuery))
+
+        val matched = BooleanArray(entries.size) { i ->
+            val entry = entries[i]
+            matches(folderTitleFromUrl(entry.absUrl) ?: entry.text.cleanTitle())
+        }
+
+        if (titleSource == TITLE_SOURCE_COMICINFO) {
+            val pending = entries.indices.filter { !matched[it] }
+            if (pending.isNotEmpty()) {
+                val seriesTitles = fetchSeriesTitles(pending.map { entries[it] })
+                pending.forEachIndexed { i, index ->
+                    val series = seriesTitles[i] ?: return@forEachIndexed
+                    if (matches(series)) matched[index] = true
+                }
+            }
+        }
+
+        // Keep the original (listing) order.
+        return entries.filterIndexed { i, _ -> matched[i] }
     }
 
     private fun buildMangasPage(entries: List<LinkEntry>, currentPage: Int): MangasPage {
