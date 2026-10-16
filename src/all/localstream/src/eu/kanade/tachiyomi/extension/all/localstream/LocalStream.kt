@@ -14,7 +14,7 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.ParsedHttpSource
+import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import okhttp3.CacheControl
 import okhttp3.Dispatcher
@@ -50,7 +50,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
-class LocalStream : ParsedHttpSource(), ConfigurableSource {
+class LocalStream : HttpSource(), ConfigurableSource {
 
     override val name = "LocalStream"
     override val lang = "all"
@@ -128,30 +128,73 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     }
 
     override val client: OkHttpClient = baseClient.newBuilder()
-        .addInterceptor { chain ->
-            val originalRequest = chain.request()
-            var response = chain.proceed(originalRequest)
-
-            val urlString = originalRequest.url.toString()
-            val coverBase = defaultCoverName.substringBeforeLast(".").trim()
-
-            if (response.code == 404 && urlString.contains("/$coverBase.", ignoreCase = true)) {
-                val currentExtOriginal = urlString.substringAfterLast(".").lowercase(Locale.ROOT)
-                for (ext in COVER_FALLBACK_EXTENSIONS) {
-                    if (ext == currentExtOriginal) continue
-                    response.close()
-
-                    val newUrl = urlString.substringBeforeLast(".") + "." + ext
-                    val newRequest = originalRequest.newBuilder().url(newUrl).build()
-                    response = chain.proceed(newRequest)
-
-                    if (response.isSuccessful) break
-                }
-            }
-            response
-        }
+        .addInterceptor { chain -> coverFallback(chain) }
         .addInterceptor { chain -> prefetcher.intercept(chain, prefetchRadius) }
         .build()
+
+    // ─── Fallback ekstensi cover ─────────────────────────────────────────────
+    // Thumbnail selalu diminta sebagai "<folder>/<nama cover>" (mis. cover.jpg). Kalau file
+    // aslinya png/webp, server menjawab 404 dan kita mencoba ekstensi lain. Dulu itu terjadi
+    // lagi di SETIAP thumbnail, SETIAP kali grid dimuat. Sekarang ekstensi yang berhasil
+    // diingat per folder dan dicoba duluan, jadi 404 dan percobaan ulangnya hilang.
+    //
+    // Hanya folder yang pernah butuh fallback yang diingat, dan hanya request yang nama
+    // filenya persis nama cover yang disentuh, jadi halaman chapter bernama "cover.jpg"
+    // tidak ikut tertukar.
+    private val coverExtCache = ConcurrentHashMap<String, String>()
+
+    private fun coverFallback(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+
+        val path = request.url.encodedPath
+        val slash = path.lastIndexOf('/')
+        val fileName = path.substring(slash + 1)
+        val dot = fileName.lastIndexOf('.')
+        val coverBase = defaultCoverName.substringBeforeLast(".").trim()
+        if (dot <= 0 || !fileName.substring(0, dot).equals(coverBase, ignoreCase = true)) {
+            return chain.proceed(request)
+        }
+
+        val dirPath = path.substring(0, slash + 1)
+        val fileBase = fileName.substring(0, dot)
+        val requestedExt = fileName.substring(dot + 1).lowercase(Locale.ROOT)
+        val folderKey = request.url.toString().substringBeforeLast('/')
+
+        // Urutan coba: ekstensi yang dulu berhasil, ekstensi yang diminta, lalu sisanya.
+        val candidates = LinkedHashSet<String>()
+        coverExtCache[folderKey]?.let { candidates.add(it) }
+        candidates.add(requestedExt)
+        candidates.addAll(COVER_FALLBACK_EXTENSIONS)
+
+        var last: Response? = null
+        for (ext in candidates) {
+            last?.close()
+            val attempt = if (ext == requestedExt) {
+                request
+            } else {
+                request.newBuilder()
+                    .url(request.url.newBuilder().encodedPath("$dirPath$fileBase.$ext").build())
+                    .build()
+            }
+            val response = chain.proceed(attempt)
+
+            if (response.isSuccessful) {
+                if (ext == requestedExt) {
+                    coverExtCache.remove(folderKey)
+                } else {
+                    if (coverExtCache.size >= MAX_COVER_EXT_CACHE) coverExtCache.clear()
+                    coverExtCache[folderKey] = ext
+                }
+                return response
+            }
+            // Selain 404 (server error, dll.) bukan soal ekstensi, jadi jangan dicoba ulang.
+            if (response.code != 404) return response
+            last = response
+        }
+
+        coverExtCache.remove(folderKey)
+        return last!!
+    }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val baseUrlPref = EditTextPreference(screen.context).apply {
@@ -211,7 +254,13 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     // refresh library). Tanpa cache, semua itu memicu request+parse HTML dari
     // nol setiap kali. TTL pendek (1 menit) menjaga data tetap relevan tapi
     // menghapus kerja berulang yang sia-sia.
-    private data class CachedDoc(val document: Document, val fetchedAt: Long)
+    // [folders] = hasil getValidLinkEntries untuk subfolder di dokumen ini, dihitung sekali
+    // saat pertama dibutuhkan lalu dipakai ulang oleh semua halaman Browse/Search. Dokumen
+    // yang sama dipakai selama masih segar, jadi hasil ini ikut basi bersamanya.
+    private class CachedDoc(val document: Document, val fetchedAt: Long) {
+        @Volatile
+        var folders: List<LinkEntry>? = null
+    }
     private val documentCache = ConcurrentHashMap<String, CachedDoc>()
 
     private data class CachedComicInfo(val xml: String, val fetchedAt: Long)
@@ -290,17 +339,30 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
      * masih segar, kita buang response yang baru (tutup koneksinya) dan pakai hasil parse
      * lama supaya tidak membangun ulang DOM tree dari HTML yang identik.
      */
-    private fun resolveDocument(response: Response): Document {
+    private fun resolveDocument(response: Response): CachedDoc {
         val key = response.request.url.toString().substringBefore("#")
         documentCache[key]?.let { cached ->
             if (isFresh(cached.fetchedAt)) {
                 response.close()
-                return cached.document
+                return cached
             }
         }
-        val document = response.asJsoup()
-        documentCache[key] = CachedDoc(document, System.currentTimeMillis())
-        return document
+        val fresh = CachedDoc(response.asJsoup(), System.currentTimeMillis())
+        documentCache[key] = fresh
+        return fresh
+    }
+
+    /**
+     * Subfolder di listing root, dengan hasil parse yang ikut di-cache bersama dokumennya.
+     * Sebelumnya setiap ganti halaman Browse/Search menjalankan ulang Uri.decode/encode untuk
+     * SELURUH entri (ratusan, bahkan ribuan) hanya untuk mengambil 24 di antaranya.
+     */
+    private fun resolveFolderEntries(response: Response): List<LinkEntry> {
+        val cached = resolveDocument(response)
+        cached.folders?.let { return it }
+        val entries = getValidLinkEntries(cached.document) { it.endsWith("/") }
+        cached.folders = entries
+        return entries
     }
 
     // ─── Helpers: Text Cleaner (Pembersih &amp;) ─────────────────────────────
@@ -381,23 +443,49 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     // ─── Helpers: Natural Sort (kunci sort dihitung sekali di depan) ─────────
     // Sebelumnya sortedWith { comparator.compare(a.text(), b.text()) } memanggil
-    // tokenize() — yang menjalankan regex — pada KEDUA operand di SETIAP
-    // perbandingan, jadi total pemanggilan regex ada di kisaran O(n log n).
-    // Dengan menghitung token setiap elemen sekali di awal (Schwartzian
-    // transform), regex hanya dijalankan O(n) kali. Untuk folder dengan
-    // banyak chapter/halaman, ini yang paling terasa di responsivitas.
-    private fun tokenize(s: String): List<String> =
-        Regex("(\\d+|\\D+)").findAll(s).map { it.value }.toList()
+    // tokenize() pada KEDUA operand di SETIAP perbandingan. Dengan menghitung token
+    // setiap elemen sekali di awal (Schwartzian transform), tokenisasi hanya berjalan
+    // O(n) kali. Untuk folder dengan banyak chapter/halaman, ini yang paling terasa.
+    //
+    // Tokenizer ditulis manual (tanpa Regex) dan token teks sudah di-lowercase di sini,
+    // jadi perbandingan tidak lagi membuat objek baru. Angka dibandingkan sebagai string
+    // (buang nol di depan, bandingkan panjang, lalu isi) tanpa BigInteger; hasilnya sama.
+    //
+    // Hanya digit ASCII (0-9) yang dianggap angka, sama seperti \d di regex sebelumnya.
+    // Memakai Char.isDigit() akan menganggap "１" (fullwidth) sebagai angka dan
+    // toBigInteger() pada token seperti "１話" melempar NumberFormatException.
+    private fun isAsciiDigit(c: Char): Boolean = c in '0'..'9'
+
+    private fun tokenize(s: String): List<String> {
+        val tokens = ArrayList<String>()
+        var start = 0
+        while (start < s.length) {
+            val digit = isAsciiDigit(s[start])
+            var end = start + 1
+            while (end < s.length && isAsciiDigit(s[end]) == digit) end++
+            val piece = s.substring(start, end)
+            tokens.add(if (digit) piece else piece.lowercase(Locale.ROOT))
+            start = end
+        }
+        return tokens
+    }
+
+    private fun compareNumeric(a: String, b: String): Int {
+        val na = a.trimStart('0')
+        val nb = b.trimStart('0')
+        if (na.length != nb.length) return na.length.compareTo(nb.length)
+        return na.compareTo(nb)
+    }
 
     private fun compareTokens(tokensA: List<String>, tokensB: List<String>): Int {
         val len = minOf(tokensA.size, tokensB.size)
         for (i in 0 until len) {
             val ta = tokensA[i]
             val tb = tokensB[i]
-            val cmp = if (ta.first().isDigit() && tb.first().isDigit()) {
-                ta.toBigInteger().compareTo(tb.toBigInteger())
+            val cmp = if (isAsciiDigit(ta[0]) && isAsciiDigit(tb[0])) {
+                compareNumeric(ta, tb)
             } else {
-                ta.lowercase().compareTo(tb.lowercase())
+                ta.compareTo(tb)
             }
             if (cmp != 0) return cmp
         }
@@ -450,11 +538,17 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         } catch (e: Exception) { "" }
     }
 
+    // Satu ComicInfo dibaca ±10 tag dan 24 entri per halaman Browse; Regex dibangun sekali per tag.
+    private val tagRegexCache = ConcurrentHashMap<String, Regex>()
+
     private fun extractXmlTag(xml: String, tag: String): String? {
-        val regex = Regex(
-            "<(?:\\w+:)?$tag(?:\\s+[^>]*)?>(.*?)</(?:\\w+:)?$tag>",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-        )
+        if (xml.isEmpty()) return null
+        val regex = tagRegexCache.getOrPut(tag) {
+            Regex(
+                "<(?:\\w+:)?$tag(?:\\s+[^>]*)?>(.*?)</(?:\\w+:)?$tag>",
+                setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+            )
+        }
         return regex.find(xml)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotBlank() }
     }
 
@@ -504,10 +598,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val fragment = response.request.url.fragment ?: ""
         val currentPage = fragment.substringAfter("page=").toIntOrNull() ?: 1
 
-        val document = resolveDocument(response)
-        val allEntries = getValidLinkEntries(document) { it.endsWith("/") }
-
-        return buildMangasPage(allEntries, currentPage)
+        return buildMangasPage(resolveFolderEntries(response), currentPage)
     }
 
     // ─── Search ──────────────────────────────────────────────────────────────
@@ -521,8 +612,7 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         val query = fragment.substringAfter("query=").substringBefore("&page=").lowercase(Locale.ROOT)
         val currentPage = fragment.substringAfter("page=").toIntOrNull() ?: 1
 
-        val document = resolveDocument(response)
-        val filteredEntries = filterByQuery(getValidLinkEntries(document) { it.endsWith("/") }, query)
+        val filteredEntries = filterByQuery(resolveFolderEntries(response), query)
 
         return buildMangasPage(filteredEntries, currentPage)
     }
@@ -596,7 +686,9 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     // ─── Manga Details ───────────────────────────────────────────────────────
 
-    override fun mangaDetailsParse(document: Document): SManga {
+    override fun mangaDetailsParse(response: Response): SManga {
+        val document = response.asJsoup()
+
         val imageLinks = getValidLinkEntries(document, requireText = false) { href ->
             IMAGE_EXTENSIONS.any { href.endsWith(it) }
         }
@@ -769,11 +861,6 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         ).apply { allowCoreThreadTimeOut(true) }
     }
 
-    private fun md5Hex(s: String): String =
-        MessageDigest.getInstance("MD5")
-            .digest(s.toByteArray(Charsets.UTF_8))
-            .joinToString("") { "%02x".format(it) }
-
     private fun LinkEntry.relativePath(): String {
         val relPath = absUrl.removePrefix(baseUrl)
         return if (relPath.startsWith("/")) relPath else "/$relPath"
@@ -888,20 +975,10 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
     }
 
     // ─── Unused / Overrides ──────────────────────────────────────────────────
-    override fun popularMangaSelector(): String = ""
-    override fun popularMangaFromElement(element: Element): SManga = SManga.create()
-    override fun popularMangaNextPageSelector(): String? = null
-    override fun searchMangaSelector(): String = ""
-    override fun searchMangaFromElement(element: Element): SManga = SManga.create()
-    override fun searchMangaNextPageSelector(): String? = null
-    override fun chapterFromElement(element: Element): SChapter = SChapter.create()
-    override fun chapterListSelector(): String = ""
-    override fun imageUrlParse(document: Document): String = ""
-    override fun pageListParse(document: Document): List<Page> = throw UnsupportedOperationException("Not used")
+    // Halaman sudah membawa URL gambar sendiri (Page.imageUrl), dan supportsLatest = false.
+    override fun imageUrlParse(response: Response): String = ""
     override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException("Not used")
-    override fun latestUpdatesSelector(): String = ""
-    override fun latestUpdatesFromElement(element: Element): SManga = SManga.create()
-    override fun latestUpdatesNextPageSelector(): String? = null
+    override fun latestUpdatesParse(response: Response): MangasPage = throw UnsupportedOperationException("Not used")
 
     companion object {
         private const val BASE_URL_PREF = "BASE_URL_PREF_LOCALSTREAM_MANGA"
@@ -933,6 +1010,9 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         /** Same, for folders where no <Series> was found. */
         private const val TITLE_CACHE_MISS_TTL_MS = 5 * 60_000L
 
+        /** Batas jumlah folder yang ekstensi covernya diingat (hanya yang pernah butuh fallback). */
+        private const val MAX_COVER_EXT_CACHE = 2000
+
         private const val DEFAULT_PREFETCH_RADIUS = 5
         private const val MAX_PREFETCH_RADIUS = 15
 
@@ -946,6 +1026,24 @@ class LocalStream : ParsedHttpSource(), ConfigurableSource {
         private val IMAGE_EXTENSIONS = listOf(".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".heic", ".jxl")
         private val PAGE_IMAGE_EXTENSIONS = listOf(".jpg", ".png", ".jpeg", ".webp", ".avif", ".gif", ".heic", ".jxl", ".bmp")
     }
+}
+
+private val HEX_DIGITS = "0123456789abcdef".toCharArray()
+
+/**
+ * MD5 sebagai 32 karakter hex huruf kecil. Dipakai untuk sidik jari chapter DAN nama file cache
+ * prefetch; format keluarannya identik dengan versi lama ("%02x"), jadi baseline sidik jari
+ * yang sudah tersimpan tetap cocok.
+ */
+private fun md5Hex(s: String): String {
+    val bytes = MessageDigest.getInstance("MD5").digest(s.toByteArray(Charsets.UTF_8))
+    val out = CharArray(bytes.size * 2)
+    for (i in bytes.indices) {
+        val v = bytes[i].toInt() and 0xFF
+        out[i * 2] = HEX_DIGITS[v ushr 4]
+        out[i * 2 + 1] = HEX_DIGITS[v and 0x0F]
+    }
+    return String(out)
 }
 
 /**
@@ -1162,11 +1260,6 @@ private class PagePrefetcher(
     // ─── Cache disk ──────────────────────────────────────────────────────────
 
     private fun fileFor(url: String): File = File(dir, md5Hex(url))
-
-    private fun md5Hex(s: String): String =
-        MessageDigest.getInstance("MD5")
-            .digest(s.toByteArray(Charsets.UTF_8))
-            .joinToString("") { "%02x".format(it) }
 
     private fun mediaTypeFor(url: String) =
         when (url.substringBefore('?').substringAfterLast('.').lowercase(Locale.ROOT)) {
