@@ -4,7 +4,6 @@ import android.app.Application
 import android.content.SharedPreferences
 import android.net.Uri
 import androidx.preference.EditTextPreference
-import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
@@ -14,7 +13,7 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import okhttp3.CacheControl
 import okhttp3.Dispatcher
@@ -35,8 +34,8 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.security.MessageDigest
-import java.text.Normalizer
 import java.util.Locale
 import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
@@ -47,10 +46,9 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
-class LocalStream : HttpSource(), ConfigurableSource {
+class LocalStream : ParsedHttpSource(), ConfigurableSource {
 
     override val name = "LocalStream"
     override val lang = "all"
@@ -75,21 +73,33 @@ class LocalStream : HttpSource(), ConfigurableSource {
             ?.coerceIn(0, MAX_PREFETCH_RADIUS)
             ?: DEFAULT_PREFETCH_RADIUS
 
+    /**
+     * Batas ukuran SATU halaman untuk ikut di-prefetch, dalam byte. Halaman yang lebih besar
+     * dari ini tidak diunduh di muka (tetap dimuat normal oleh reader saat dibuka).
+     * 0 = tanpa batas. Input boleh desimal, titik atau koma ("2.5" / "2,5").
+     */
+    private val prefetchMaxBytes: Long
+        get() {
+            val mb = preferences.getString(PREFETCH_MAX_MB_PREF, DEFAULT_PREFETCH_MAX_MB.toString())
+                ?.trim()
+                ?.replace(',', '.')
+                ?.toDoubleOrNull()
+                ?.takeIf { it >= 0.0 }
+                ?.coerceAtMost(MAX_PREFETCH_MAX_MB)
+                ?: DEFAULT_PREFETCH_MAX_MB
+            return (mb * 1024 * 1024).toLong()
+        }
+
     /** true = cek isi folder tiap chapter saat daftar chapter dimuat, supaya gambar baru terdeteksi. */
     private val detectChanges: Boolean
         get() = preferences.getBoolean(DETECT_CHANGES_PREF, true)
 
     /**
-     * Sumber judul entri:
-     * - comicinfo: <Series> di ComicInfo.xml menimpa nama folder (perilaku lama).
-     * - folder   : selalu nama folder.
-     * - auto     : nama folder diprioritaskan. Pengecualian: <Series> dipakai kalau memuat simbol
-     *              khusus (yang tidak bisa ada di nama folder) DAN cocok dengan nama folder
-     *              selain simbolnya. Kalau tidak cocok, <Series> dianggap usang dan nama folder
-     *              yang dipakai.
+     * true  = judul entri diambil dari <Series> di ComicInfo.xml (kalau ada), menimpa nama folder.
+     * false = judul selalu memakai nama folder, ComicInfo.xml hanya dipakai untuk metadata lain.
      */
-    private val titleSource: String
-        get() = preferences.getString(TITLE_SOURCE_PREF, TITLE_SOURCE_AUTO) ?: TITLE_SOURCE_AUTO
+    private val useComicInfoTitle: Boolean
+        get() = preferences.getBoolean(USE_COMICINFO_TITLE_PREF, true)
 
     // ─── Client: disetel untuk server lokal/LAN yang cepat ───────────────────
     // - Timeout dipersingkat karena server biasanya ada di localhost/LAN, jadi
@@ -124,127 +134,90 @@ class LocalStream : HttpSource(), ConfigurableSource {
             client = baseClient.newBuilder().cache(null).build(),
             headersProvider = { headers },
             cacheDirProvider = { Injekt.get<Application>().cacheDir },
+            maxPageBytesProvider = { prefetchMaxBytes },
         )
     }
 
     override val client: OkHttpClient = baseClient.newBuilder()
-        .addInterceptor { chain -> coverFallback(chain) }
+        .addInterceptor { chain ->
+            val originalRequest = chain.request()
+            var response = chain.proceed(originalRequest)
+
+            val urlString = originalRequest.url.toString()
+            val coverBase = defaultCoverName.substringBeforeLast(".").trim()
+
+            if (response.code == 404 && urlString.contains("/$coverBase.", ignoreCase = true)) {
+                val currentExtOriginal = urlString.substringAfterLast(".").lowercase(Locale.ROOT)
+                for (ext in COVER_FALLBACK_EXTENSIONS) {
+                    if (ext == currentExtOriginal) continue
+                    response.close()
+
+                    val newUrl = urlString.substringBeforeLast(".") + "." + ext
+                    val newRequest = originalRequest.newBuilder().url(newUrl).build()
+                    response = chain.proceed(newRequest)
+
+                    if (response.isSuccessful) break
+                }
+            }
+            response
+        }
         .addInterceptor { chain -> prefetcher.intercept(chain, prefetchRadius) }
         .build()
-
-    // ─── Fallback ekstensi cover ─────────────────────────────────────────────
-    // Thumbnail selalu diminta sebagai "<folder>/<nama cover>" (mis. cover.jpg). Kalau file
-    // aslinya png/webp, server menjawab 404 dan kita mencoba ekstensi lain. Dulu itu terjadi
-    // lagi di SETIAP thumbnail, SETIAP kali grid dimuat. Sekarang ekstensi yang berhasil
-    // diingat per folder dan dicoba duluan, jadi 404 dan percobaan ulangnya hilang.
-    //
-    // Hanya folder yang pernah butuh fallback yang diingat, dan hanya request yang nama
-    // filenya persis nama cover yang disentuh, jadi halaman chapter bernama "cover.jpg"
-    // tidak ikut tertukar.
-    private val coverExtCache = ConcurrentHashMap<String, String>()
-
-    private fun coverFallback(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-
-        val path = request.url.encodedPath
-        val slash = path.lastIndexOf('/')
-        val fileName = path.substring(slash + 1)
-        val dot = fileName.lastIndexOf('.')
-        val coverBase = defaultCoverName.substringBeforeLast(".").trim()
-        if (dot <= 0 || !fileName.substring(0, dot).equals(coverBase, ignoreCase = true)) {
-            return chain.proceed(request)
-        }
-
-        val dirPath = path.substring(0, slash + 1)
-        val fileBase = fileName.substring(0, dot)
-        val requestedExt = fileName.substring(dot + 1).lowercase(Locale.ROOT)
-        val folderKey = request.url.toString().substringBeforeLast('/')
-
-        // Urutan coba: ekstensi yang dulu berhasil, ekstensi yang diminta, lalu sisanya.
-        val candidates = LinkedHashSet<String>()
-        coverExtCache[folderKey]?.let { candidates.add(it) }
-        candidates.add(requestedExt)
-        candidates.addAll(COVER_FALLBACK_EXTENSIONS)
-
-        var last: Response? = null
-        for (ext in candidates) {
-            last?.close()
-            val attempt = if (ext == requestedExt) {
-                request
-            } else {
-                request.newBuilder()
-                    .url(request.url.newBuilder().encodedPath("$dirPath$fileBase.$ext").build())
-                    .build()
-            }
-            val response = chain.proceed(attempt)
-
-            if (response.isSuccessful) {
-                if (ext == requestedExt) {
-                    coverExtCache.remove(folderKey)
-                } else {
-                    if (coverExtCache.size >= MAX_COVER_EXT_CACHE) coverExtCache.clear()
-                    coverExtCache[folderKey] = ext
-                }
-                return response
-            }
-            // Selain 404 (server error, dll.) bukan soal ekstensi, jadi jangan dicoba ulang.
-            if (response.code != 404) return response
-            last = response
-        }
-
-        coverExtCache.remove(folderKey)
-        return last!!
-    }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val baseUrlPref = EditTextPreference(screen.context).apply {
             key = BASE_URL_PREF
             title = "Server URL (Round Sync / Termux)"
-            summary = "Enter the local URL of your Rclone Serve instance."
+            summary = "Masukkan URL lokal dari Rclone Serve."
             setDefaultValue("http://127.0.0.1:8080")
         }
         screen.addPreference(baseUrlPref)
 
         val coverNamePref = EditTextPreference(screen.context).apply {
             key = COVER_NAME_PREF
-            title = "Default Cover File Name"
-            summary = "Base name of the cover file (e.g. cover.jpg)."
+            title = "Nama File Cover Default"
+            summary = "Nama dasar cover (Contoh: cover.jpg)."
             setDefaultValue("cover.jpg")
         }
         screen.addPreference(coverNamePref)
 
         val prefetchPref = EditTextPreference(screen.context).apply {
             key = PREFETCH_PREF
-            title = "Page Prefetch (before & after)"
-            summary = "Number of pages around the current page that are downloaded in parallel " +
-                "(0 = disabled, max $MAX_PREFETCH_RADIUS). Default: $DEFAULT_PREFETCH_RADIUS."
+            title = "Prefetch Halaman (sebelum & sesudah)"
+            summary = "Jumlah halaman di sekitar halaman aktif yang diunduh paralel " +
+                "(0 = nonaktif, maks $MAX_PREFETCH_RADIUS). Default: $DEFAULT_PREFETCH_RADIUS."
             setDefaultValue(DEFAULT_PREFETCH_RADIUS.toString())
         }
         screen.addPreference(prefetchPref)
 
+        val prefetchMaxSizePref = EditTextPreference(screen.context).apply {
+            key = PREFETCH_MAX_MB_PREF
+            title = "Batas Ukuran Halaman Prefetch (MB)"
+            summary = "Halaman yang ukurannya melebihi batas ini tidak di-prefetch (tetap dimuat normal " +
+                "saat dibuka), jadi panel raksasa tidak memakan kuota & ruang cache. " +
+                "0 = tanpa batas, maks ${MAX_PREFETCH_MAX_MB.toInt()}. Default: ${DEFAULT_PREFETCH_MAX_MB.toInt()}."
+            setDefaultValue(DEFAULT_PREFETCH_MAX_MB.toInt().toString())
+        }
+        screen.addPreference(prefetchMaxSizePref)
+
         val detectChangesPref = SwitchPreferenceCompat(screen.context).apply {
             key = DETECT_CHANGES_PREF
-            title = "Detect new pages in chapters"
-            summary = "When the chapter list is refreshed, each chapter folder is checked so added or " +
-                "removed images are picked up right away. Turn this off if your library is large and " +
-                "refreshing feels slow."
+            title = "Deteksi halaman baru di chapter"
+            summary = "Saat daftar chapter dimuat ulang, isi tiap folder chapter dicek supaya gambar " +
+                "yang ditambah/dihapus langsung terbaca. Matikan jika library besar dan refresh terasa lambat."
             setDefaultValue(true)
         }
         screen.addPreference(detectChangesPref)
 
-        val titleSourcePref = ListPreference(screen.context).apply {
-            key = TITLE_SOURCE_PREF
-            title = "Entry Title Source"
-            entries = arrayOf(
-                "ComicInfo first (<Series> overrides the folder name)",
-                "Folder name only",
-                "Automatic (folder name, unless the title has special symbols)",
-            )
-            entryValues = arrayOf(TITLE_SOURCE_COMICINFO, TITLE_SOURCE_FOLDER, TITLE_SOURCE_AUTO)
-            setDefaultValue(TITLE_SOURCE_AUTO)
-            summary = "%s"
+        val comicInfoTitlePref = SwitchPreferenceCompat(screen.context).apply {
+            key = USE_COMICINFO_TITLE_PREF
+            title = "Pakai judul dari ComicInfo (Series)"
+            summary = "Aktif: judul diambil dari tag <Series> di ComicInfo.xml jika ada, menimpa nama folder. " +
+                "Nonaktif: judul selalu memakai nama folder. Judul entri yang sudah tersimpan di aplikasi " +
+                "baru ikut berubah setelah Clear database (untuk entri di luar library) atau refresh detail."
+            setDefaultValue(true)
         }
-        screen.addPreference(titleSourcePref)
+        screen.addPreference(comicInfoTitlePref)
     }
 
     // ─── Cache ringan untuk listing direktori & ComicInfo.xml ────────────────
@@ -254,73 +227,11 @@ class LocalStream : HttpSource(), ConfigurableSource {
     // refresh library). Tanpa cache, semua itu memicu request+parse HTML dari
     // nol setiap kali. TTL pendek (1 menit) menjaga data tetap relevan tapi
     // menghapus kerja berulang yang sia-sia.
-    // [folders] = hasil getValidLinkEntries untuk subfolder di dokumen ini, dihitung sekali
-    // saat pertama dibutuhkan lalu dipakai ulang oleh semua halaman Browse/Search. Dokumen
-    // yang sama dipakai selama masih segar, jadi hasil ini ikut basi bersamanya.
-    private class CachedDoc(val document: Document, val fetchedAt: Long) {
-        @Volatile
-        var folders: List<LinkEntry>? = null
-    }
+    private data class CachedDoc(val document: Document, val fetchedAt: Long)
     private val documentCache = ConcurrentHashMap<String, CachedDoc>()
 
     private data class CachedComicInfo(val xml: String, val fetchedAt: Long)
     private val comicInfoCache = ConcurrentHashMap<String, CachedComicInfo>()
-
-    /**
-     * <Series> per folder, used for titles in Browse/Search. Persisted (so it survives the app
-     * being killed) and valid for [TITLE_CACHE_TTL_MS]. Stored as "<epochMillis>|<series>".
-     * An empty series means "no <Series> found"; that is only kept for [TITLE_CACHE_MISS_TTL_MS],
-     * so a server that failed for a moment doesn't leave folder names in the list for long.
-     */
-    private class CachedSeries(val series: String?)
-
-    private val seriesPrefs: SharedPreferences by lazy {
-        Injekt.get<Application>().getSharedPreferences("source_${id}_series_titles", 0x0000)
-    }
-
-    private val seriesPruned = AtomicBoolean(false)
-
-    private fun readSeriesCache(key: String): CachedSeries? {
-        val raw = seriesPrefs.getString(key, null) ?: return null
-        val fetchedAt = raw.substringBefore('|').toLongOrNull() ?: return null
-        val age = System.currentTimeMillis() - fetchedAt
-        val series = raw.substringAfter('|').takeIf { it.isNotEmpty() }
-        val ttl = if (series != null) TITLE_CACHE_TTL_MS else TITLE_CACHE_MISS_TTL_MS
-        if (age < 0 || age >= ttl) return null
-        return CachedSeries(series)
-    }
-
-    private fun writeSeriesCache(key: String, series: String?) {
-        seriesPrefs.edit().putString(key, "${System.currentTimeMillis()}|${series.orEmpty()}").apply()
-    }
-
-    /** Once per app process: remove expired entries so the file doesn't keep growing. */
-    private fun pruneSeriesCacheOnce() {
-        if (!seriesPruned.compareAndSet(false, true)) return
-        val now = System.currentTimeMillis()
-        val expired = seriesPrefs.all.filter { (_, value) ->
-            val fetchedAt = (value as? String)?.substringBefore('|')?.toLongOrNull()
-            val age = if (fetchedAt == null) -1L else now - fetchedAt
-            fetchedAt == null || age < 0 || age >= TITLE_CACHE_TTL_MS
-        }.keys
-        if (expired.isEmpty()) return
-        val editor = seriesPrefs.edit()
-        expired.forEach { editor.remove(it) }
-        editor.apply()
-    }
-
-    /** Same key for the same folder, whether it comes from the browse list or the details page. */
-    private fun cacheKeyFor(url: String): String {
-        val clean = url.substringBefore("#")
-        return clean.toHttpUrlOrNull()?.toString() ?: clean
-    }
-
-    /** Folder documents are cached per manga now, so drop expired entries to keep memory bounded. */
-    private fun evictStaleCaches() {
-        documentCache.values.removeIf { !isFresh(it.fetchedAt) }
-        comicInfoCache.values.removeIf { !isFresh(it.fetchedAt) }
-        pruneSeriesCacheOnce()
-    }
 
     private fun isFresh(fetchedAt: Long): Boolean =
         System.currentTimeMillis() - fetchedAt < CACHE_TTL_MS
@@ -339,30 +250,17 @@ class LocalStream : HttpSource(), ConfigurableSource {
      * masih segar, kita buang response yang baru (tutup koneksinya) dan pakai hasil parse
      * lama supaya tidak membangun ulang DOM tree dari HTML yang identik.
      */
-    private fun resolveDocument(response: Response): CachedDoc {
+    private fun resolveDocument(response: Response): Document {
         val key = response.request.url.toString().substringBefore("#")
         documentCache[key]?.let { cached ->
             if (isFresh(cached.fetchedAt)) {
                 response.close()
-                return cached
+                return cached.document
             }
         }
-        val fresh = CachedDoc(response.asJsoup(), System.currentTimeMillis())
-        documentCache[key] = fresh
-        return fresh
-    }
-
-    /**
-     * Subfolder di listing root, dengan hasil parse yang ikut di-cache bersama dokumennya.
-     * Sebelumnya setiap ganti halaman Browse/Search menjalankan ulang Uri.decode/encode untuk
-     * SELURUH entri (ratusan, bahkan ribuan) hanya untuk mengambil 24 di antaranya.
-     */
-    private fun resolveFolderEntries(response: Response): List<LinkEntry> {
-        val cached = resolveDocument(response)
-        cached.folders?.let { return it }
-        val entries = getValidLinkEntries(cached.document) { it.endsWith("/") }
-        cached.folders = entries
-        return entries
+        val document = response.asJsoup()
+        documentCache[key] = CachedDoc(document, System.currentTimeMillis())
+        return document
     }
 
     // ─── Helpers: Text Cleaner (Pembersih &amp;) ─────────────────────────────
@@ -443,49 +341,23 @@ class LocalStream : HttpSource(), ConfigurableSource {
 
     // ─── Helpers: Natural Sort (kunci sort dihitung sekali di depan) ─────────
     // Sebelumnya sortedWith { comparator.compare(a.text(), b.text()) } memanggil
-    // tokenize() pada KEDUA operand di SETIAP perbandingan. Dengan menghitung token
-    // setiap elemen sekali di awal (Schwartzian transform), tokenisasi hanya berjalan
-    // O(n) kali. Untuk folder dengan banyak chapter/halaman, ini yang paling terasa.
-    //
-    // Tokenizer ditulis manual (tanpa Regex) dan token teks sudah di-lowercase di sini,
-    // jadi perbandingan tidak lagi membuat objek baru. Angka dibandingkan sebagai string
-    // (buang nol di depan, bandingkan panjang, lalu isi) tanpa BigInteger; hasilnya sama.
-    //
-    // Hanya digit ASCII (0-9) yang dianggap angka, sama seperti \d di regex sebelumnya.
-    // Memakai Char.isDigit() akan menganggap "１" (fullwidth) sebagai angka dan
-    // toBigInteger() pada token seperti "１話" melempar NumberFormatException.
-    private fun isAsciiDigit(c: Char): Boolean = c in '0'..'9'
-
-    private fun tokenize(s: String): List<String> {
-        val tokens = ArrayList<String>()
-        var start = 0
-        while (start < s.length) {
-            val digit = isAsciiDigit(s[start])
-            var end = start + 1
-            while (end < s.length && isAsciiDigit(s[end]) == digit) end++
-            val piece = s.substring(start, end)
-            tokens.add(if (digit) piece else piece.lowercase(Locale.ROOT))
-            start = end
-        }
-        return tokens
-    }
-
-    private fun compareNumeric(a: String, b: String): Int {
-        val na = a.trimStart('0')
-        val nb = b.trimStart('0')
-        if (na.length != nb.length) return na.length.compareTo(nb.length)
-        return na.compareTo(nb)
-    }
+    // tokenize() — yang menjalankan regex — pada KEDUA operand di SETIAP
+    // perbandingan, jadi total pemanggilan regex ada di kisaran O(n log n).
+    // Dengan menghitung token setiap elemen sekali di awal (Schwartzian
+    // transform), regex hanya dijalankan O(n) kali. Untuk folder dengan
+    // banyak chapter/halaman, ini yang paling terasa di responsivitas.
+    private fun tokenize(s: String): List<String> =
+        Regex("(\\d+|\\D+)").findAll(s).map { it.value }.toList()
 
     private fun compareTokens(tokensA: List<String>, tokensB: List<String>): Int {
         val len = minOf(tokensA.size, tokensB.size)
         for (i in 0 until len) {
             val ta = tokensA[i]
             val tb = tokensB[i]
-            val cmp = if (isAsciiDigit(ta[0]) && isAsciiDigit(tb[0])) {
-                compareNumeric(ta, tb)
+            val cmp = if (ta.first().isDigit() && tb.first().isDigit()) {
+                ta.toBigInteger().compareTo(tb.toBigInteger())
             } else {
-                ta.compareTo(tb)
+                ta.lowercase().compareTo(tb.lowercase())
             }
             if (cmp != 0) return cmp
         }
@@ -538,22 +410,16 @@ class LocalStream : HttpSource(), ConfigurableSource {
         } catch (e: Exception) { "" }
     }
 
-    // Satu ComicInfo dibaca ±10 tag dan 24 entri per halaman Browse; Regex dibangun sekali per tag.
-    private val tagRegexCache = ConcurrentHashMap<String, Regex>()
-
     private fun extractXmlTag(xml: String, tag: String): String? {
-        if (xml.isEmpty()) return null
-        val regex = tagRegexCache.getOrPut(tag) {
-            Regex(
-                "<(?:\\w+:)?$tag(?:\\s+[^>]*)?>(.*?)</(?:\\w+:)?$tag>",
-                setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-            )
-        }
+        val regex = Regex(
+            "<(?:\\w+:)?$tag(?:\\s+[^>]*)?>(.*?)</(?:\\w+:)?$tag>",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
         return regex.find(xml)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotBlank() }
     }
 
-    /** Judul TIDAK diatur di sini; lihat [resolveTitle] yang dipanggil dari mangaDetailsParse. */
     private fun parseComicInfo(xml: String, manga: SManga) {
+        val series = extractXmlTag(xml, "Series")
         val summary = extractXmlTag(xml, "Summary")?.cleanTitle()
 
         val writer = extractXmlTag(xml, "Writer")
@@ -563,6 +429,9 @@ class LocalStream : HttpSource(), ConfigurableSource {
         val genre = extractXmlTag(xml, "Genre")
         val categories = extractXmlTag(xml, "Categories")
 
+        if (useComicInfoTitle && !series.isNullOrBlank()) {
+            manga.title = series.cleanTitle()
+        }
         if (!summary.isNullOrBlank()) {
             manga.description = summary
         }
@@ -598,7 +467,10 @@ class LocalStream : HttpSource(), ConfigurableSource {
         val fragment = response.request.url.fragment ?: ""
         val currentPage = fragment.substringAfter("page=").toIntOrNull() ?: 1
 
-        return buildMangasPage(resolveFolderEntries(response), currentPage)
+        val document = resolveDocument(response)
+        val allEntries = getValidLinkEntries(document) { it.endsWith("/") }
+
+        return buildMangasPage(allEntries, currentPage)
     }
 
     // ─── Search ──────────────────────────────────────────────────────────────
@@ -612,47 +484,11 @@ class LocalStream : HttpSource(), ConfigurableSource {
         val query = fragment.substringAfter("query=").substringBefore("&page=").lowercase(Locale.ROOT)
         val currentPage = fragment.substringAfter("page=").toIntOrNull() ?: 1
 
-        val filteredEntries = filterByQuery(resolveFolderEntries(response), query)
+        val document = resolveDocument(response)
+        val filteredEntries = getValidLinkEntries(document) { it.endsWith("/") }
+            .filter { it.text.cleanTitle().lowercase(Locale.ROOT).contains(query) }
 
         return buildMangasPage(filteredEntries, currentPage)
-    }
-
-    /**
-     * Matches the query against entry names. Besides a plain "contains" on the folder name, both
-     * sides are normalized (NFKC, lowercase, letters/digits only), so "Re:Zero" or "Re：Zero" still
-     * finds the folder "Re Zero". This is the same rule "Automatic" mode uses to decide that
-     * <Series> and the folder name are the same title, so whatever title is shown in the list
-     * can also be found by searching for it (this is what library migration relies on).
-     * In "ComicInfo first" mode <Series> may differ completely from the folder name, so it is
-     * searched too (read in parallel and cached, so large libraries are slower on the first search).
-     */
-    private fun filterByQuery(entries: List<LinkEntry>, query: String): List<LinkEntry> {
-        val rawQuery = query.trim()
-        if (rawQuery.isEmpty()) return entries
-        val normalizedQuery = normalizeTitle(rawQuery)
-
-        fun matches(name: String): Boolean =
-            name.lowercase(Locale.ROOT).contains(rawQuery) ||
-                (normalizedQuery.isNotEmpty() && normalizeTitle(name).contains(normalizedQuery))
-
-        val matched = BooleanArray(entries.size) { i ->
-            val entry = entries[i]
-            matches(folderTitleFromUrl(entry.absUrl) ?: entry.text.cleanTitle())
-        }
-
-        if (titleSource == TITLE_SOURCE_COMICINFO) {
-            val pending = entries.indices.filter { !matched[it] }
-            if (pending.isNotEmpty()) {
-                val seriesTitles = fetchSeriesTitles(pending.map { entries[it] })
-                pending.forEachIndexed { i, index ->
-                    val series = seriesTitles[i] ?: return@forEachIndexed
-                    if (matches(series)) matched[index] = true
-                }
-            }
-        }
-
-        // Keep the original (listing) order.
-        return entries.filterIndexed { i, _ -> matched[i] }
     }
 
     private fun buildMangasPage(entries: List<LinkEntry>, currentPage: Int): MangasPage {
@@ -663,15 +499,9 @@ class LocalStream : HttpSource(), ConfigurableSource {
         val endIndex = minOf(startIndex + itemsPerPage, entries.size)
         val pagedEntries = entries.subList(startIndex, endIndex)
 
-        // Resolve titles with the same rules as the details page ("Entry Title Source").
-        evictStaleCaches()
-        val seriesTitles = fetchSeriesTitles(pagedEntries)
-        warmNextPage(entries, endIndex, itemsPerPage)
-
-        val mangas = pagedEntries.mapIndexed { index, entry ->
+        val mangas = pagedEntries.map { entry ->
             SManga.create().apply {
-                val folderName = folderTitleFromUrl(entry.absUrl) ?: entry.text.cleanTitle()
-                title = resolveTitle(seriesTitles[index], folderName) ?: folderName
+                title = entry.text.cleanTitle()
 
                 val relPath = entry.absUrl.removePrefix(baseUrl)
                 url = if (relPath.startsWith("/")) relPath else "/$relPath"
@@ -686,9 +516,7 @@ class LocalStream : HttpSource(), ConfigurableSource {
 
     // ─── Manga Details ───────────────────────────────────────────────────────
 
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
-
+    override fun mangaDetailsParse(document: Document): SManga {
         val imageLinks = getValidLinkEntries(document, requireText = false) { href ->
             IMAGE_EXTENSIONS.any { href.endsWith(it) }
         }
@@ -699,7 +527,7 @@ class LocalStream : HttpSource(), ConfigurableSource {
         } ?: imageLinks.firstOrNull()
 
         val manga = SManga.create().apply {
-            description = "No description"
+            description = "Folder manga lokal dari Server LocalStream (WebDAV/HTTP)."
             status = SManga.UNKNOWN
             if (coverEntry != null) {
                 thumbnail_url = coverEntry.absUrl
@@ -707,122 +535,24 @@ class LocalStream : HttpSource(), ConfigurableSource {
             initialized = true
         }
 
-        val comicInfoXml = getComicInfoXml(document, cacheKeyFor(document.baseUri()))
+        val comicInfoXml = getComicInfoXml(document, document.baseUri())
         if (comicInfoXml.isNotBlank()) {
             parseComicInfo(comicInfoXml, manga)
         }
 
-        // Judul ditentukan sesuai pengaturan "Sumber judul entri". Kalau hasilnya null (mode
-        // comicinfo tanpa <Series>), judul tidak dikirim dan aplikasi mempertahankan judul lamanya.
-        val series = if (comicInfoXml.isNotBlank()) extractXmlTag(comicInfoXml, "Series")?.cleanTitle() else null
-        resolveTitle(series, folderTitle(document))?.let { manga.title = it }
+        // Judul ComicInfo dimatikan: kirim nama folder supaya judul yang sudah tersimpan di
+        // aplikasi (mis. hasil <Series> lama) ikut dikoreksi saat detail di-refresh.
+        if (!useComicInfoTitle) {
+            folderTitle(document)?.let { manga.title = it }
+        }
 
         return manga
     }
 
     /** Nama folder entri, diambil dari segmen terakhir URL halaman detail. */
-    private fun folderTitle(document: Document): String? = folderTitleFromUrl(document.baseUri())
-
-    /** Same derivation for browse and details, so both always produce an identical folder name. */
-    private fun folderTitleFromUrl(url: String): String? {
-        val path = url.substringBefore("#").substringBefore("?").trimEnd('/')
+    private fun folderTitle(document: Document): String? {
+        val path = document.baseUri().substringBefore("#").substringBefore("?").trimEnd('/')
         return Uri.decode(path.substringAfterLast('/')).cleanTitle().takeIf { it.isNotBlank() }
-    }
-
-    private fun resolveTitle(series: String?, folderName: String?): String? = when (titleSource) {
-        TITLE_SOURCE_FOLDER -> folderName
-        TITLE_SOURCE_AUTO -> when {
-            series != null && folderName != null &&
-                hasSpecialChars(series) && isSameTitle(series, folderName) -> series
-            else -> folderName ?: series
-        }
-        else -> series
-    }
-
-    /** true jika ada karakter selain huruf, angka, dan spasi (mis. : ? / ! ' . ～). */
-    private fun hasSpecialChars(s: String): Boolean = s.any { !it.isLetterOrDigit() && !it.isWhitespace() }
-
-    /**
-     * Nama folder tidak boleh memuat sebagian simbol (: ? * " < > | /), jadi <Series> yang benar
-     * bisa berbeda dari nama folder HANYA di simbol/spasi/huruf besar-kecil. Kedua judul
-     * dibandingkan setelah NFKC (mis. "：" lebar-penuh menjadi ":") dan setelah membuang semua
-     * karakter selain huruf/angka.
-     */
-    private fun isSameTitle(a: String, b: String): Boolean {
-        val normalizedA = normalizeTitle(a)
-        // Judul yang seluruhnya simbol jadi kosong setelah normalisasi; jangan dianggap cocok.
-        return normalizedA.isNotEmpty() && normalizedA == normalizeTitle(b)
-    }
-
-    private fun normalizeTitle(s: String): String =
-        Normalizer.normalize(s, Normalizer.Form.NFKC)
-            .lowercase(Locale.ROOT)
-            .filter { it.isLetterOrDigit() }
-
-    // ─── Titles in Browse / Search ───────────────────────────────────────────
-    // The directory listing only knows folder names. To match the details page, the
-    // <Series> of every entry on the current page is fetched in parallel (and cached).
-    // "Folder name only" mode needs no extra requests.
-
-    private val titleExecutor: ExecutorService by lazy {
-        ThreadPoolExecutor(
-            TITLE_PARALLELISM,
-            TITLE_PARALLELISM,
-            30L,
-            TimeUnit.SECONDS,
-            LinkedBlockingQueue<Runnable>(),
-            ThreadFactory { runnable -> Thread(runnable, "LocalStream-title").apply { isDaemon = true } },
-        ).apply { allowCoreThreadTimeOut(true) }
-    }
-
-    // Titles of the NEXT page are read in the background (a few at a time, so covers and the
-    // current page aren't starved), so scrolling down usually finds them already cached.
-    private val titleWarmExecutor: ExecutorService by lazy {
-        ThreadPoolExecutor(
-            TITLE_WARM_PARALLELISM,
-            TITLE_WARM_PARALLELISM,
-            30L,
-            TimeUnit.SECONDS,
-            LinkedBlockingQueue<Runnable>(),
-            ThreadFactory { runnable -> Thread(runnable, "LocalStream-title-warm").apply { isDaemon = true } },
-        ).apply { allowCoreThreadTimeOut(true) }
-    }
-
-    private fun warmNextPage(entries: List<LinkEntry>, from: Int, count: Int) {
-        if (titleSource == TITLE_SOURCE_FOLDER || from >= entries.size) return
-        entries.subList(from, minOf(from + count, entries.size))
-            .map { it.absUrl }
-            .forEach { url -> titleWarmExecutor.execute { fetchSeriesTitle(url) } }
-    }
-
-    private fun fetchSeriesTitles(entries: List<LinkEntry>): List<String?> {
-        if (titleSource == TITLE_SOURCE_FOLDER) return List(entries.size) { null }
-
-        val futures = titleExecutor.invokeAll(
-            entries.map { entry -> Callable { fetchSeriesTitle(entry.absUrl) } },
-        )
-        return futures.map { future ->
-            try {
-                future.get()
-            } catch (e: Exception) {
-                null
-            }
-        }
-    }
-
-    private fun fetchSeriesTitle(folderUrl: String): String? {
-        val key = cacheKeyFor(folderUrl)
-        readSeriesCache(key)?.let { return it.series }
-
-        val series = try {
-            val xml = comicInfoCache[key]?.takeIf { isFresh(it.fetchedAt) }?.xml
-                ?: getComicInfoXml(client.newCall(GET(folderUrl, headers)).execute().asJsoup(), key)
-            extractXmlTag(xml, "Series")?.cleanTitle()
-        } catch (e: Exception) {
-            return null // transient failure: fall back to the folder name, but don't cache it
-        }
-        writeSeriesCache(key, series)
-        return series
     }
 
     // ─── Deteksi perubahan isi chapter ───────────────────────────────────────
@@ -860,6 +590,11 @@ class LocalStream : HttpSource(), ConfigurableSource {
             ThreadFactory { runnable -> Thread(runnable, "LocalStream-fingerprint").apply { isDaemon = true } },
         ).apply { allowCoreThreadTimeOut(true) }
     }
+
+    private fun md5Hex(s: String): String =
+        MessageDigest.getInstance("MD5")
+            .digest(s.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
 
     private fun LinkEntry.relativePath(): String {
         val relPath = absUrl.removePrefix(baseUrl)
@@ -975,46 +710,39 @@ class LocalStream : HttpSource(), ConfigurableSource {
     }
 
     // ─── Unused / Overrides ──────────────────────────────────────────────────
-    // Halaman sudah membawa URL gambar sendiri (Page.imageUrl), dan supportsLatest = false.
-    override fun imageUrlParse(response: Response): String = ""
+    override fun popularMangaSelector(): String = ""
+    override fun popularMangaFromElement(element: Element): SManga = SManga.create()
+    override fun popularMangaNextPageSelector(): String? = null
+    override fun searchMangaSelector(): String = ""
+    override fun searchMangaFromElement(element: Element): SManga = SManga.create()
+    override fun searchMangaNextPageSelector(): String? = null
+    override fun chapterFromElement(element: Element): SChapter = SChapter.create()
+    override fun chapterListSelector(): String = ""
+    override fun imageUrlParse(document: Document): String = ""
+    override fun pageListParse(document: Document): List<Page> = throw UnsupportedOperationException("Not used")
     override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException("Not used")
-    override fun latestUpdatesParse(response: Response): MangasPage = throw UnsupportedOperationException("Not used")
+    override fun latestUpdatesSelector(): String = ""
+    override fun latestUpdatesFromElement(element: Element): SManga = SManga.create()
+    override fun latestUpdatesNextPageSelector(): String? = null
 
     companion object {
         private const val BASE_URL_PREF = "BASE_URL_PREF_LOCALSTREAM_MANGA"
         private const val COVER_NAME_PREF = "COVER_NAME_PREF_LOCALSTREAM_MANGA"
         private const val PREFETCH_PREF = "PREFETCH_PREF_LOCALSTREAM_MANGA"
+        private const val PREFETCH_MAX_MB_PREF = "PREFETCH_MAX_MB_PREF_LOCALSTREAM_MANGA"
         private const val DETECT_CHANGES_PREF = "DETECT_CHANGES_PREF_LOCALSTREAM_MANGA"
-        private const val TITLE_SOURCE_PREF = "TITLE_SOURCE_PREF_LOCALSTREAM_MANGA"
-        private const val TITLE_SOURCE_COMICINFO = "comicinfo"
-        private const val TITLE_SOURCE_FOLDER = "folder"
-        private const val TITLE_SOURCE_AUTO = "auto"
+        private const val USE_COMICINFO_TITLE_PREF = "USE_COMICINFO_TITLE_PREF_LOCALSTREAM_MANGA"
 
         /** Folder chapter yang dicek bersamaan saat daftar chapter dimuat. */
         private const val FINGERPRINT_PARALLELISM = 8
         private const val FINGERPRINT_LENGTH = 10
 
-        /** Entry folders whose ComicInfo.xml is read at the same time (one browse page = 24 entries). */
-        private const val TITLE_PARALLELISM = 24
-
-        /** Background readers for the next page's titles. */
-        private const val TITLE_WARM_PARALLELISM = 4
-
-        /**
-         * How long a <Series> read from ComicInfo.xml is reused for the Browse list (also across
-         * app restarts). Editing a ComicInfo.xml shows up in Browse after this long; the details
-         * page always re-reads it.
-         */
-        private const val TITLE_CACHE_TTL_MS = 30 * 60_000L
-
-        /** Same, for folders where no <Series> was found. */
-        private const val TITLE_CACHE_MISS_TTL_MS = 5 * 60_000L
-
-        /** Batas jumlah folder yang ekstensi covernya diingat (hanya yang pernah butuh fallback). */
-        private const val MAX_COVER_EXT_CACHE = 2000
-
         private const val DEFAULT_PREFETCH_RADIUS = 5
         private const val MAX_PREFETCH_RADIUS = 15
+
+        /** Batas ukuran halaman prefetch (MB). Maks disesuaikan dengan batas total cache disk prefetch. */
+        private const val DEFAULT_PREFETCH_MAX_MB = 5.0
+        private const val MAX_PREFETCH_MAX_MB = 100.0
 
         // Berapa lama listing direktori / ComicInfo.xml dianggap "masih segar"
         // sebelum diambil ulang dari server. 60 detik cukup untuk menghapus
@@ -1026,24 +754,6 @@ class LocalStream : HttpSource(), ConfigurableSource {
         private val IMAGE_EXTENSIONS = listOf(".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".heic", ".jxl")
         private val PAGE_IMAGE_EXTENSIONS = listOf(".jpg", ".png", ".jpeg", ".webp", ".avif", ".gif", ".heic", ".jxl", ".bmp")
     }
-}
-
-private val HEX_DIGITS = "0123456789abcdef".toCharArray()
-
-/**
- * MD5 sebagai 32 karakter hex huruf kecil. Dipakai untuk sidik jari chapter DAN nama file cache
- * prefetch; format keluarannya identik dengan versi lama ("%02x"), jadi baseline sidik jari
- * yang sudah tersimpan tetap cocok.
- */
-private fun md5Hex(s: String): String {
-    val bytes = MessageDigest.getInstance("MD5").digest(s.toByteArray(Charsets.UTF_8))
-    val out = CharArray(bytes.size * 2)
-    for (i in bytes.indices) {
-        val v = bytes[i].toInt() and 0xFF
-        out[i * 2] = HEX_DIGITS[v ushr 4]
-        out[i * 2 + 1] = HEX_DIGITS[v and 0x0F]
-    }
-    return String(out)
 }
 
 /**
@@ -1063,11 +773,22 @@ private fun md5Hex(s: String): String {
  * newCachelessCallWithProgress() yang memang mematikan cache OkHttp, jadi kita
  * pakai cache sendiri. Salinan di disk dihapus setelah dilayani karena Mihon
  * menyimpan gambar itu di ChapterCache miliknya.
+ *
+ * Batas ukuran halaman ([maxPageBytesProvider]): halaman yang lebih besar dari batas
+ * TIDAK di-prefetch. Ukuran dicari tanpa request tambahan (tanpa HEAD):
+ *   - Content-Length dibaca dari header respons; kalau melewati batas, respons langsung
+ *     ditutup sebelum satu byte isi pun diunduh.
+ *   - Kalau server tidak mengirim Content-Length (chunked), byte dihitung saat mengunduh
+ *     dan unduhan dibatalkan begitu melewati batas.
+ * Ukuran yang sudah diketahui diingat ([knownSizes]) sehingga halaman besar yang sama
+ * tidak diprobe lagi dan tidak dijadwalkan ulang. Yang disimpan adalah ukuran (bukan
+ * status "terlalu besar"), jadi kalau batas di pengaturan diubah, keputusannya ikut berubah.
  */
 private class PagePrefetcher(
     private val client: OkHttpClient,
     private val headersProvider: () -> Headers,
     private val cacheDirProvider: () -> File,
+    private val maxPageBytesProvider: () -> Long,
 ) {
 
     private class PageRef(val pages: List<String>, val index: Int) {
@@ -1079,6 +800,12 @@ private class PagePrefetcher(
     private val refs = ConcurrentHashMap<String, PageRef>()
     private val chapters = LinkedHashMap<String, List<String>>() // dijaga lewat synchronized(chapters)
     private val tasks = ConcurrentHashMap<String, Task>()
+
+    /**
+     * Ukuran (byte) halaman yang sudah pernah terlihat saat prefetch. Kalau unduhan dibatalkan di
+     * tengah jalan, nilainya adalah batas bawah ("minimal segini"). Dibersihkan bersama indeks chapter.
+     */
+    private val knownSizes = ConcurrentHashMap<String, Long>()
 
     private val executor = ThreadPoolExecutor(
         PARALLELISM,
@@ -1107,12 +834,25 @@ private class PagePrefetcher(
             urls.forEachIndexed { i, u -> refs[u] = PageRef(urls, i) }
 
             // Batasi memori: simpan indeks beberapa chapter terakhir saja.
+            // (Daftar ulang chapter yang sama sengaja TIDAK menghapus knownSizes.)
             while (chapters.size > MAX_INDEXED_CHAPTERS) {
                 val eldest = chapters.keys.first()
-                chapters.remove(eldest)?.forEach { refs.remove(it) }
+                chapters.remove(eldest)?.forEach {
+                    refs.remove(it)
+                    knownSizes.remove(it)
+                }
             }
         }
     }
+
+    /** Catat ukuran halaman, hanya untuk halaman yang masih terdaftar (supaya map tidak membengkak). */
+    private fun rememberSize(url: String, bytes: Long) {
+        if (bytes >= 0 && refs.containsKey(url)) knownSizes[url] = bytes
+    }
+
+    /** true = ukuran halaman sudah diketahui dan melewati [limit] → prefetch dimatikan untuk halaman ini. */
+    private fun isOversized(url: String, limit: Long): Boolean =
+        limit > 0 && (knownSizes[url] ?: 0L) > limit
 
     // ─── Interceptor ─────────────────────────────────────────────────────────
 
@@ -1133,10 +873,12 @@ private class PagePrefetcher(
 
     private fun neighborUrls(ref: PageRef, radius: Int): List<String> {
         val result = ArrayList<String>(radius * 2)
+        val limit = maxPageBytesProvider()
 
         fun add(i: Int) {
             val u = ref.pages.getOrNull(i) ?: return
             if (refs[u]?.requested == true) return // sudah pernah diminta reader
+            if (isOversized(u, limit)) return // panel raksasa: jangan di-prefetch
             result.add(u)
         }
 
@@ -1245,10 +987,22 @@ private class PagePrefetcher(
         val tmp = File(target.parentFile, target.name + ".part")
 
         try {
-            client.newCall(GET(url, headersProvider())).execute().use { response ->
-                if (!response.isSuccessful) return
-                val body = response.body ?: return
-                tmp.outputStream().use { out -> body.byteStream().copyTo(out, 64 * 1024) }
+            val complete = client.newCall(GET(url, headersProvider())).execute().use { response ->
+                if (!response.isSuccessful) return@use false
+                val body = response.body ?: return@use false
+                val limit = maxPageBytesProvider()
+
+                // Content-Length ada di header, jadi ukuran diketahui SEBELUM isi diunduh.
+                // -1 = tidak diketahui (chunked / dikompres) → dihitung saat menyalin.
+                val declared = body.contentLength()
+                rememberSize(url, declared)
+                if (limit > 0 && declared > limit) return@use false // use{} menutup respons tanpa membaca isi
+
+                copyCapped(url, body.byteStream(), tmp, limit)
+            }
+            if (!complete) {
+                tmp.delete()
+                return
             }
             // Rename atomik: reader tidak pernah melihat file yang setengah jadi.
             if (!tmp.renameTo(target)) tmp.delete()
@@ -1257,9 +1011,37 @@ private class PagePrefetcher(
         }
     }
 
+    /**
+     * Salin [input] ke [target] sambil menghitung byte. Kembalikan false (dan catat ukurannya)
+     * begitu jumlahnya melewati [limit]; limit <= 0 berarti tanpa batas.
+     */
+    private fun copyCapped(url: String, input: InputStream, target: File, limit: Long): Boolean {
+        val buffer = ByteArray(COPY_BUFFER_BYTES)
+        var total = 0L
+        target.outputStream().use { out ->
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                total += read
+                if (limit > 0 && total > limit) {
+                    rememberSize(url, total) // batas bawah; cukup untuk menandai halaman ini besar
+                    return false
+                }
+                out.write(buffer, 0, read)
+            }
+        }
+        rememberSize(url, total)
+        return true
+    }
+
     // ─── Cache disk ──────────────────────────────────────────────────────────
 
     private fun fileFor(url: String): File = File(dir, md5Hex(url))
+
+    private fun md5Hex(s: String): String =
+        MessageDigest.getInstance("MD5")
+            .digest(s.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
 
     private fun mediaTypeFor(url: String) =
         when (url.substringBefore('?').substringAfterLast('.').lowercase(Locale.ROOT)) {
@@ -1309,6 +1091,8 @@ private class PagePrefetcher(
 
         /** Indeks urutan halaman disimpan untuk N chapter terakhir saja. */
         const val MAX_INDEXED_CHAPTERS = 4
+
+        const val COPY_BUFFER_BYTES = 64 * 1024
 
         const val MAX_DISK_BYTES = 150L * 1024 * 1024
         const val FILE_TTL_MS = 10 * 60_000L
